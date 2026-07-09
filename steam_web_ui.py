@@ -32,6 +32,13 @@ FEISHU_LOGIN_THREAD: threading.Thread | None = None
 GRAPH_LOGIN_THREAD: threading.Thread | None = None
 
 
+TASK_LABELS = {
+    "full": "功能1：登录新邮箱 / Steam / Dota2",
+    "mail_password": "功能2：绑定安全邮箱 / 改邮箱密码",
+    "graph_credential": "功能3：补邮箱 API凭据",
+}
+
+
 HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -353,12 +360,14 @@ def worker(args: argparse.Namespace, pause_controller: steam_outlook_batch.Pause
     def on_pending(accounts):
         with STATE_LOCK:
             STATE["pending"] = [serialize_account(account) for account in accounts]
+            STATE["message"] = f"已读取队列：{len(accounts)} 个账号。"
 
     def on_start(account, index, total):
         with STATE_LOCK:
             STATE["current"] = serialize_account(account)
             STATE["status"] = f"running {index}/{total}"
             STATE["waiting"] = False
+            STATE["message"] = f"正在处理第 {index}/{total} 个：第 {account.row_number} 行 {account.email}"
 
     def on_done(account, steam_id):
         suffix = f": {steam_id}" if steam_id else ""
@@ -387,9 +396,10 @@ def worker(args: argparse.Namespace, pause_controller: steam_outlook_batch.Pause
         with STATE_LOCK:
             STATE["running"] = True
             STATE["status"] = "starting"
-            STATE["message"] = ""
+            STATE["message"] = f"{TASK_LABELS.get(args.task_mode, args.task_mode)} 已启动，正在读取飞书队列..."
             STATE["started_at"] = time.time()
             STATE["finished_at"] = None
+        append_log(f"worker started: {TASK_LABELS.get(args.task_mode, args.task_mode)}")
         asyncio.run(
             steam_outlook_batch.run_with_callbacks(
                 args,
@@ -413,7 +423,10 @@ def worker(args: argparse.Namespace, pause_controller: steam_outlook_batch.Pause
             STATE["running"] = False
             STATE["waiting"] = False
             STATE["status"] = "error" if fatal_message else "idle"
-            STATE["message"] = fatal_message
+            if fatal_message:
+                STATE["message"] = fatal_message
+            elif STATE.get("message", "").startswith("正在处理") or STATE.get("status") == "idle":
+                STATE["message"] = f"{TASK_LABELS.get(args.task_mode, args.task_mode)} 已结束。"
             STATE["finished_at"] = time.time()
 
 
@@ -458,6 +471,9 @@ def graph_login_worker(email: str, graph_client_id: str | None, accounts_config:
             STATE["message"] = "缺少邮箱。请先填写安全邮箱或目标邮箱。"
         return
     append_log(f"Graph API login started: {email}")
+    with STATE_LOCK:
+        STATE["status"] = "graph login starting"
+        STATE["message"] = f"正在为 {email} 准备 Microsoft Graph API 授权..."
     try:
         client_id = steam_outlook_batch.graph_mail.load_client_id(
             steam_outlook_batch.graph_mail.DEFAULT_CONFIG,
@@ -533,16 +549,23 @@ class Handler(BaseHTTPRequestHandler):
             data = self._body()
             try:
                 args = build_args(data)
+                with STATE_LOCK:
+                    STATE["status"] = "loading pending"
+                    STATE["message"] = f"正在读取飞书队列：{TASK_LABELS.get(args.task_mode, args.task_mode)}..."
                 accounts, _, _, _ = steam_outlook_batch.read_pending_accounts(args)
                 if args.limit:
                     accounts = accounts[: args.limit]
                 with STATE_LOCK:
                     STATE["pending"] = [serialize_account(account) for account in accounts]
                     STATE["status"] = "pending loaded"
+                    STATE["message"] = f"队列读取完成：{len(accounts)} 个账号。"
                 append_log(f"loaded pending: {len(accounts)}")
                 self._json({"ok": True})
             except Exception as exc:
                 append_log(f"pending failed: {exc}")
+                with STATE_LOCK:
+                    STATE["status"] = "pending failed"
+                    STATE["message"] = f"队列读取失败：{exc}"
                 self._json({"ok": False, "error": str(exc)}, 500)
             return
         if path == "/api/start":
@@ -554,7 +577,16 @@ class Handler(BaseHTTPRequestHandler):
             args = build_args(data)
             PAUSE_CONTROLLER = steam_outlook_batch.PauseController()
             RUN_THREAD = threading.Thread(target=worker, args=(args, PAUSE_CONTROLLER), daemon=True)
-            append_log("start requested")
+            task_label = TASK_LABELS.get(args.task_mode, args.task_mode)
+            append_log(f"start requested: {task_label}")
+            with STATE_LOCK:
+                STATE["running"] = True
+                STATE["waiting"] = False
+                STATE["status"] = "starting"
+                STATE["current"] = None
+                STATE["message"] = f"{task_label} 已收到启动请求，正在准备后台任务..."
+                STATE["started_at"] = time.time()
+                STATE["finished_at"] = None
             RUN_THREAD.start()
             self._json({"ok": True})
             return
@@ -617,7 +649,12 @@ class Handler(BaseHTTPRequestHandler):
             if PAUSE_CONTROLLER:
                 PAUSE_CONTROLLER.stop()
             with STATE_LOCK:
-                STATE["status"] = "stopping"
+                if STATE["running"]:
+                    STATE["status"] = "stopping"
+                    STATE["message"] = "正在停止当前任务..."
+                else:
+                    STATE["status"] = "idle"
+                    STATE["message"] = "当前没有运行中的任务。"
             self._json({"ok": True})
             return
         if path.startswith("/api/"):
