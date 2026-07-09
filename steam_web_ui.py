@@ -147,7 +147,14 @@ document.getElementById("sheet_url").value = defaultUrl;
 async function api(path, body) {
   const opt = body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {};
   const r = await fetch(path, opt);
-  const data = await r.json();
+  const text = await r.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (err) {
+    const preview = text.replace(/\s+/g, " ").slice(0, 300);
+    throw new Error(`接口返回的不是 JSON：${preview || r.status}`);
+  }
   if (!r.ok || data.ok === false) {
     throw new Error(data.error || `请求失败: ${r.status}`);
   }
