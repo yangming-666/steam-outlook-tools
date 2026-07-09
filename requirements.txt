@@ -1,0 +1,8 @@
+playwright>=1.45.0
+pywinauto>=0.6.8
+msal>=1.30.0
+pyautogui>=0.9.54
+pyperclip>=1.9.0
+rapidocr-onnxruntime>=1.4.4
+opencv-python>=4.10.0
+Pillow>=10.0.0

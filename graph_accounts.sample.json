@@ -1,0 +1,9 @@
+{
+  "accounts": [
+    {
+      "email": "security@example.com",
+      "client_id": "PASTE_YOUR_MICROSOFT_GRAPH_APP_CLIENT_ID_HERE",
+      "cache": ".graph-token-security_example.com.bin"
+    }
+  ]
+}

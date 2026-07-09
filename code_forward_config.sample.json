@@ -1,0 +1,24 @@
+{
+  "webhooks": [
+    {
+      "name": "local-test",
+      "url": "http://127.0.0.1:9999/code",
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json"
+      }
+    }
+  ],
+  "smtp": {
+    "enabled": false,
+    "host": "smtp.example.com",
+    "port": 587,
+    "username": "sender@example.com",
+    "password": "smtp-password-or-app-password",
+    "from": "sender@example.com",
+    "to": [
+      "receiver@example.com"
+    ],
+    "use_tls": true
+  }
+}
