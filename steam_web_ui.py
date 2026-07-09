@@ -538,7 +538,7 @@ class Handler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 self._json(dict(STATE))
             return
-        if self.path == "/" or self.path.startswith("/index"):
+        if path == "/" or path.startswith("/index"):
             raw = HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -695,8 +695,9 @@ def main():
     parser.add_argument("--no-open", action="store_true")
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    url = f"http://{args.host}:{args.port}/"
+    url = f"http://{args.host}:{args.port}/?v={APP_VERSION}"
     print(f"Web UI: {url}")
+    print(f"Version: {APP_VERSION}")
     if not args.no_open:
         webbrowser.open(url)
     server.serve_forever()
