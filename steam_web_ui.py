@@ -48,6 +48,8 @@ HTML = r"""<!doctype html>
     label { display: block; font-size: 12px; color: #516073; margin-top: 10px; }
     input, select { width: 100%; box-sizing: border-box; height: 34px; padding: 6px 8px; border: 1px solid #b8c2d1; border-radius: 6px; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .subsection { border-top: 1px solid #e2e8f0; margin-top: 14px; padding-top: 12px; }
+    .subsection h3 { margin: 0 0 8px; font-size: 13px; color: #334155; }
     .actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
     button { height: 34px; padding: 0 12px; border: 1px solid #9aa7b8; border-radius: 6px; background: #fff; cursor: pointer; }
     button.primary { background: #2563eb; color: white; border-color: #2563eb; }
@@ -76,10 +78,18 @@ HTML = r"""<!doctype html>
   <main>
     <section>
       <h2>控制</h2>
+      <label>任务模式</label>
+      <select id="task_mode" onchange="applyTaskMode()">
+        <option value="full">1. 登录新邮箱 / 登录 Steam / 测 Dota2 / 更新飞书</option>
+        <option value="mail_password">2. 绑定安全邮箱 / 改邮箱密码 / 可开启 API 登录</option>
+        <option value="graph_credential">3. 已测 Steam 的邮箱补 API 凭据</option>
+      </select>
+      <div class="subsection">
+      <h3>通用配置</h3>
       <label>飞书表格链接</label>
       <input id="sheet_url">
       <div class="row">
-        <div><label>读取范围</label><input id="sheet_range" value="A1:I1000"></div>
+        <div><label>读取范围</label><input id="sheet_range" value="A1:J1000"></div>
         <div><label>限制数量</label><input id="limit" type="number" min="1" placeholder="空=全部"></div>
       </div>
       <label>目标邮箱（可空；填写后只处理这个邮箱）</label>
@@ -95,27 +105,37 @@ HTML = r"""<!doctype html>
       <label>Graph 多邮箱配置</label>
       <input id="graph_accounts_config" value="graph_accounts.json">
       <div class="row">
-        <div><label>Steam 路径</label><input id="steam_exe" placeholder="自动检测"></div>
         <div><label>认证</label><select id="feishu_auth"><option value="user">当前账号</option><option value="app">应用</option></select></div>
-      </div>
-      <div class="row">
         <div><label>Outlook X</label><input id="outlook_x" type="number" value="0"></div>
-        <div><label>安全邮箱 X</label><input id="security_x" type="number" value="1280"></div>
       </div>
+      </div>
+      <div class="subsection" data-section="full">
+      <h3>功能1：新邮箱 Steam / Dota2</h3>
       <div class="row">
-        <div><label>Steam 登录</label><select id="enable_steam_login"><option value="1">开启</option><option value="0">关闭</option></select></div>
+        <div><label>Steam 路径</label><input id="steam_exe" placeholder="自动检测"></div>
         <div><label>Dota 验证</label><select id="enable_dota_check"><option value="0">关闭</option><option value="1">开启</option></select></div>
       </div>
       <div class="row">
-        <div><label>邮箱安全维护</label><select id="enable_mail_maintenance"><option value="0">关闭</option><option value="1">开启</option></select></div>
+        <div><label>Steam 登录</label><select id="enable_steam_login"><option value="1">开启</option><option value="0">关闭</option></select></div>
+        <div><label>Dota 最多开房次数</label><input id="dota_max_attempts" type="number" min="1" max="5" value="3"></div>
+      </div>
+      </div>
+      <div class="subsection" data-section="mail_password">
+      <h3>功能2：邮箱安全维护</h3>
+      <div class="row">
+        <div><label>邮箱安全维护</label><select id="enable_mail_maintenance"><option value="1">开启</option><option value="0">关闭</option></select></div>
         <div><label>目标邮箱 API 登录</label><select id="enable_target_graph_login"><option value="0">关闭</option><option value="1">开启</option></select></div>
       </div>
-      <label>Dota 最多开房次数</label>
-      <input id="dota_max_attempts" type="number" min="1" max="5" value="3">
       <label>绑定安全邮箱（可空；开启邮箱安全维护后生效）</label>
       <input id="bind_security_email" placeholder="例如 security@example.com">
       <label>新邮箱密码（可空；留空自动生成并在提示中显示）</label>
       <input id="new_email_password" placeholder="空=每个账号自动生成">
+      </div>
+      <div class="subsection" data-section="graph_credential">
+      <h3>功能3：补邮箱 API 凭据</h3>
+      <label>处理规则</label>
+      <input value="读取已有 steam id 且“凭据”为空的行；只做 Microsoft Graph 授权并写入 J 列“凭据”。" disabled>
+      </div>
       <div class="actions">
         <button onclick="loadPending()">刷新队列</button>
         <button onclick="feishuLogin()">飞书重新授权</button>
@@ -175,7 +195,9 @@ async function callAction(path, body) {
 }
 function settings() {
   const limit = document.getElementById("limit").value.trim();
+  const taskMode = document.getElementById("task_mode").value;
   return {
+    task_mode: taskMode,
     sheet_url: document.getElementById("sheet_url").value.trim(),
     sheet_range: document.getElementById("sheet_range").value.trim(),
     steam_exe: document.getElementById("steam_exe").value.trim(),
@@ -197,6 +219,27 @@ function settings() {
     ,bind_security_email: document.getElementById("bind_security_email").value.trim()
     ,new_email_password: document.getElementById("new_email_password").value.trim()
   };
+}
+function applyTaskMode() {
+  const mode = document.getElementById("task_mode").value;
+  document.querySelectorAll("[data-section]").forEach(el => {
+    el.style.display = el.dataset.section === mode ? "block" : "none";
+  });
+  if (mode === "full") {
+    document.getElementById("enable_steam_login").value = "1";
+    document.getElementById("enable_mail_maintenance").value = "0";
+    document.getElementById("enable_target_graph_login").value = "0";
+  } else if (mode === "mail_password") {
+    document.getElementById("enable_steam_login").value = "0";
+    document.getElementById("enable_dota_check").value = "0";
+    document.getElementById("enable_mail_maintenance").value = "1";
+    document.getElementById("enable_target_graph_login").value = "1";
+  } else if (mode === "graph_credential") {
+    document.getElementById("enable_steam_login").value = "0";
+    document.getElementById("enable_dota_check").value = "0";
+    document.getElementById("enable_mail_maintenance").value = "0";
+    document.getElementById("enable_target_graph_login").value = "0";
+  }
 }
 async function loadPending(){ await callAction("/api/pending", settings()); }
 async function startRun(){ await callAction("/api/start", settings()); }
@@ -227,12 +270,13 @@ async function refresh(){
   msg.style.display = s.message ? "block" : "none";
   const dot = document.getElementById("dot");
   dot.className = "dot" + (s.waiting ? " waiting" : (s.running ? " running" : ""));
-  document.getElementById("pending_body").innerHTML = s.pending.map(a => `<tr><td>${a.row_number}</td><td>${a.steam_username}</td><td>${a.email}</td></tr>`).join("");
+  document.getElementById("pending_body").innerHTML = s.pending.map(a => `<tr><td>${a.row_number}</td><td>${a.steam_username || "-"}</td><td>${a.email}</td></tr>`).join("");
   const logs = document.getElementById("logs");
   logs.textContent = s.logs.join("\n");
   logs.scrollTop = logs.scrollHeight;
 }
 setInterval(refresh, 1500);
+applyTaskMode();
 refresh();
 </script>
 </body>
@@ -250,10 +294,12 @@ def append_log(message: str) -> None:
 
 
 def build_args(data: dict) -> argparse.Namespace:
+    task_mode = data.get("task_mode") or "full"
     return argparse.Namespace(
+        task_mode=task_mode,
         sheet_url=data.get("sheet_url") or steam_outlook_batch.DEFAULT_FEISHU_SHEET_URL,
         sheet_id=None,
-        sheet_range=data.get("sheet_range") or "A1:I1000",
+        sheet_range=data.get("sheet_range") or "A1:J1000",
         feishu_auth=data.get("feishu_auth") or "user",
         feishu_config=str(steam_outlook_batch.feishu_tool.DEFAULT_CONFIG),
         feishu_start_script=str(steam_outlook_batch.feishu_tool.DEFAULT_START_SCRIPT),
@@ -283,11 +329,11 @@ def build_args(data: dict) -> argparse.Namespace:
         pause_between=True,
         continue_on_error=False,
         error_dir="errors",
-        enable_steam_login=bool(data.get("enable_steam_login", True)),
-        enable_dota_check=bool(data.get("enable_dota_check")),
+        enable_steam_login=bool(data.get("enable_steam_login", True)) and task_mode == "full",
+        enable_dota_check=bool(data.get("enable_dota_check")) and task_mode == "full",
         dota_max_attempts=int(data.get("dota_max_attempts") or 3),
-        enable_mail_maintenance=bool(data.get("enable_mail_maintenance")),
-        enable_target_graph_login=bool(data.get("enable_target_graph_login")),
+        enable_mail_maintenance=(task_mode == "mail_password") or bool(data.get("enable_mail_maintenance")),
+        enable_target_graph_login=bool(data.get("enable_target_graph_login")) and task_mode == "mail_password",
         bind_security_email=data.get("bind_security_email") or "",
         new_email_password=data.get("new_email_password") or "",
     )

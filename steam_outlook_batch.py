@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,8 @@ from outlook_batch_login import (
 STEAM_ID_COL = "I"
 BIG_ACCOUNT_COL = "G"
 EMAIL_PASSWORD_COL = "D"
+GRAPH_CREDENTIAL_COL = "J"
+GRAPH_CREDENTIAL_HEADER = "凭据"
 STEAM_GUARD_CODE_RE = re.compile(r"\b[A-Z0-9]{5}\b")
 
 
@@ -45,6 +48,7 @@ class SteamAccount:
     email: str
     email_password: str
     steam_id: str
+    graph_credential: str = ""
 
     @property
     def password(self) -> str:
@@ -85,6 +89,7 @@ def read_pending_accounts(args) -> tuple[list[SteamAccount], dict[str, Any], str
     steam_username_idx = header.index("steam账号")
     email_idx = header.index("邮箱账号")
     steam_id_idx = header.index("steam id")
+    graph_credential_idx = header.index(GRAPH_CREDENTIAL_HEADER) if GRAPH_CREDENTIAL_HEADER in header else None
     password_indices = [idx for idx, name in enumerate(header) if name == "密码"]
     if len(password_indices) < 2:
         raise SystemExit('Feishu sheet must contain two "密码" columns: Steam password and email password.')
@@ -93,6 +98,7 @@ def read_pending_accounts(args) -> tuple[list[SteamAccount], dict[str, Any], str
     email_password_idx = password_indices[1]
 
     accounts: list[SteamAccount] = []
+    task_mode = getattr(args, "task_mode", "full")
     for row_number, row in enumerate(rows[1:], start=2):
         padded = list(row) + [""] * (len(header) - len(row))
         steam_id = cell_text(padded[steam_id_idx])
@@ -100,8 +106,20 @@ def read_pending_accounts(args) -> tuple[list[SteamAccount], dict[str, Any], str
         steam_password = cell_text(padded[steam_password_idx])
         email = cell_text(padded[email_idx])
         email_password = cell_text(padded[email_password_idx])
-        if steam_id or not steam_username or not steam_password or not email or not email_password:
+        graph_credential = cell_text(padded[graph_credential_idx]) if graph_credential_idx is not None and graph_credential_idx < len(padded) else ""
+        if not email:
             continue
+        if task_mode == "full":
+            if steam_id or not steam_username or not steam_password or not email_password:
+                continue
+        elif task_mode == "mail_password":
+            if not email_password:
+                continue
+        elif task_mode == "graph_credential":
+            if not steam_id or graph_credential:
+                continue
+        else:
+            raise SystemExit(f"Unknown task mode: {task_mode}")
         accounts.append(
             SteamAccount(
                 row_number=row_number,
@@ -110,6 +128,7 @@ def read_pending_accounts(args) -> tuple[list[SteamAccount], dict[str, Any], str
                 email=email,
                 email_password=email_password,
                 steam_id=steam_id,
+                graph_credential=graph_credential,
             )
         )
 
@@ -120,6 +139,18 @@ def read_pending_accounts(args) -> tuple[list[SteamAccount], dict[str, Any], str
     if target_email:
         accounts = [account for account in accounts if account.email.casefold() == target_email]
     return accounts, config, spreadsheet_token, sheet_id
+
+
+def ensure_graph_credential_header(args, feishu_config: dict[str, Any], spreadsheet_token: str, sheet_id: str) -> None:
+    feishu_tool.write_sheet(
+        feishu_config,
+        spreadsheet_token,
+        sheet_id,
+        f"{GRAPH_CREDENTIAL_COL}1:{GRAPH_CREDENTIAL_COL}1",
+        [[GRAPH_CREDENTIAL_HEADER]],
+        use_uat=args.feishu_auth == "user",
+        package_root=Path(args.lark_mcp_root),
+    )
 
 
 def find_steam_exe(explicit_path: str | None) -> Path:
@@ -632,7 +663,7 @@ async def run_graph_api_login(
     pause_controller=None,
     on_manual_wait=lambda message: None,
     on_manual_resume=lambda message: None,
-) -> None:
+) -> str:
     client_id = graph_mail.load_client_id(Path(args.graph_config), args.graph_client_id)
     cache_path = Path(graph_mail.safe_cache_name(email))
     app, cache, flow = graph_mail.begin_login_flow(client_id, cache_path)
@@ -649,7 +680,29 @@ async def run_graph_api_login(
         on_manual_resume(f"Graph API login finished for {email}")
     account_email = result.get("id_token_claims", {}).get("preferred_username") or email
     graph_mail.save_account_config(Path(args.graph_accounts_config), account_email, client_id, cache_path)
-    log(f"Graph API login saved: {account_email} -> {cache_path}")
+    credential = f"graph:{account_email};cache:{cache_path};saved:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    log(f"Graph API login saved: {credential}")
+    return credential
+
+
+def write_graph_credential(
+    args,
+    feishu_config: dict[str, Any],
+    spreadsheet_token: str,
+    sheet_id: str,
+    row_number: int,
+    credential: str,
+) -> None:
+    ensure_graph_credential_header(args, feishu_config, spreadsheet_token, sheet_id)
+    feishu_tool.write_sheet(
+        feishu_config,
+        spreadsheet_token,
+        sheet_id,
+        f"{GRAPH_CREDENTIAL_COL}{row_number}:{GRAPH_CREDENTIAL_COL}{row_number}",
+        [[credential]],
+        use_uat=args.feishu_auth == "user",
+        package_root=Path(args.lark_mcp_root),
+    )
 
 
 async def verify_security_mailbox(page: Page, security_email: str) -> bool:
@@ -756,19 +809,62 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
     on_manual_wait = callbacks.get("on_manual_wait", lambda message: None)
     on_manual_resume = callbacks.get("on_manual_resume", lambda message: None)
     pause_controller = callbacks.get("pause_controller")
+    task_mode = getattr(args, "task_mode", "full")
 
     accounts, feishu_config, spreadsheet_token, sheet_id = read_pending_accounts(args)
     if args.limit:
         accounts = accounts[: args.limit]
     on_pending(accounts)
     if not accounts:
-        log("No pending accounts with empty steam id.")
+        log("No pending accounts for selected task mode.")
         return
 
     log(f"Pending accounts: {len(accounts)}")
     if args.list_pending:
         for account in accounts:
             log(f"row {account.row_number}: {account.steam_username} / {account.email}")
+        return
+
+    if task_mode == "mail_password":
+        args.enable_mail_maintenance = True
+        args.enable_target_graph_login = False
+        args.enable_steam_login = False
+        args.enable_dota_check = False
+    elif task_mode == "graph_credential":
+        ensure_graph_credential_header(args, feishu_config, spreadsheet_token, sheet_id)
+        for idx, account in enumerate(accounts, start=1):
+            if pause_controller and pause_controller.should_stop():
+                log("Stopped before next account.")
+                break
+            on_account_start(account, idx, len(accounts))
+            log(f"[{idx}/{len(accounts)}] row {account.row_number}: API credential for {account.email}")
+            try:
+                credential = await run_graph_api_login(
+                    args,
+                    account.email,
+                    log,
+                    pause_controller,
+                    on_manual_wait,
+                    on_manual_resume,
+                )
+                write_graph_credential(args, feishu_config, spreadsheet_token, sheet_id, account.row_number, credential)
+                log(f"Wrote Graph credential to row {account.row_number}: {credential}")
+                on_account_done(account, "graph credential saved")
+            except Exception as exc:
+                log(f"ERROR on row {account.row_number}: {exc}")
+                on_account_error(account, exc)
+                if not args.continue_on_error:
+                    break
+            if args.pause_between:
+                if pause_controller:
+                    log("Waiting for web Continue button.")
+                    if not pause_controller.wait():
+                        log("Stopped while waiting.")
+                        break
+                else:
+                    answer = input("Press Enter for next account, or type q then Enter to stop: ").strip().lower()
+                    if answer == "q":
+                        break
         return
 
     steam_exe = None
@@ -865,7 +961,7 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                         on_manual_resume,
                     )
                     if args.enable_target_graph_login:
-                        await run_graph_api_login(
+                        credential = await run_graph_api_login(
                             args,
                             account.email,
                             log,
@@ -873,6 +969,8 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                             on_manual_wait,
                             on_manual_resume,
                         )
+                        write_graph_credential(args, feishu_config, spreadsheet_token, sheet_id, account.row_number, credential)
+                        log(f"Wrote Graph credential to row {account.row_number}: {credential}")
 
                 steam_id = ""
                 if args.enable_steam_login:
@@ -950,7 +1048,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Login Outlook/Steam accounts, fetch verification codes, and write results to Feishu sheet.")
     parser.add_argument("--sheet-url", default=DEFAULT_FEISHU_SHEET_URL)
     parser.add_argument("--sheet-id")
-    parser.add_argument("--sheet-range", default="A1:I1000")
+    parser.add_argument("--sheet-range", default="A1:J1000")
+    parser.add_argument(
+        "--task-mode",
+        choices=["full", "mail_password", "graph_credential"],
+        default="full",
+        help="full=login mailbox/Steam/Dota; mail_password=bind security email/change mailbox password; graph_credential=only save Microsoft Graph credential.",
+    )
     parser.add_argument("--feishu-auth", choices=["user", "app"], default="user")
     parser.add_argument("--feishu-config", default=str(feishu_tool.DEFAULT_CONFIG))
     parser.add_argument("--feishu-start-script", default=str(feishu_tool.DEFAULT_START_SCRIPT))
