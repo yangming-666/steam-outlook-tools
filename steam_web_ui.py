@@ -153,7 +153,7 @@ async function api(path, body) {
     data = text ? JSON.parse(text) : {};
   } catch (err) {
     const preview = text.replace(/\s+/g, " ").slice(0, 300);
-    throw new Error(`接口返回的不是 JSON：${preview || r.status}`);
+    throw new Error(`${path} 接口返回的不是 JSON：${preview || r.status}`);
   }
   if (!r.ok || data.ok === false) {
     throw new Error(data.error || `请求失败: ${r.status}`);
@@ -409,6 +409,11 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(size).decode("utf-8"))
 
     def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/state":
+            with STATE_LOCK:
+                self._json(dict(STATE))
+            return
         if self.path == "/" or self.path.startswith("/index"):
             raw = HTML.encode("utf-8")
             self.send_response(200)
@@ -416,6 +421,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+            return
+        if path.startswith("/api/"):
+            self._json({"ok": False, "error": f"API not found: {path}"}, 404)
             return
         self.send_error(404)
 
@@ -499,6 +507,9 @@ class Handler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 STATE["status"] = "stopping"
             self._json({"ok": True})
+            return
+        if path.startswith("/api/"):
+            self._json({"ok": False, "error": f"API not found: {path}"}, 404)
             return
         self.send_error(404)
 
