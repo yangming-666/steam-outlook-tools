@@ -593,7 +593,19 @@ async def wait_for_security_mailbox(
             log(f"Security mailbox confirmed: {security_email}")
             on_manual_resume(f"Security mailbox confirmed: {security_email}")
             return
-        message = f"请在窗口2登录/确认安全邮箱 {security_email}，完成后回到 localhost 控制台点击“已完成人工操作 / 继续”。"
+        try:
+            body = await page.locator("body").inner_text(timeout=3000)
+        except Exception:
+            body = ""
+        if any(marker in body for marker in ["验证你的电子邮件", "Verify your email", "无法发送验证码", "can't send a code", "其他登录方法"]):
+            message = (
+                f"窗口2正在登录安全邮箱 {security_email}，但这个安全邮箱本身触发了 Microsoft 二次验证。"
+                "请手动完成它的验证；如果页面提示“无法发送验证码”，这个安全邮箱当前不能用于网页收码，"
+                "建议换一个已能正常进入收件箱的安全邮箱，或在 Web UI 把“安全验证码来源”改成 Microsoft Graph 多邮箱。"
+                "处理完成并看到安全邮箱收件箱后，点击“已完成人工操作 / 继续”。"
+            )
+        else:
+            message = f"请在窗口2登录/确认安全邮箱 {security_email}，完成后回到 localhost 控制台点击“已完成人工操作 / 继续”。"
         log(message)
         on_manual_wait(message)
         if pause_controller:
