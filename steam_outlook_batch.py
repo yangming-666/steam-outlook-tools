@@ -116,6 +116,9 @@ def read_pending_accounts(args) -> tuple[list[SteamAccount], dict[str, Any], str
     start_row = getattr(args, "start_row", None)
     if start_row:
         accounts = [account for account in accounts if account.row_number >= int(start_row)]
+    target_email = (getattr(args, "target_email", "") or "").strip().casefold()
+    if target_email:
+        accounts = [account for account in accounts if account.email.casefold() == target_email]
     return accounts, config, spreadsheet_token, sheet_id
 
 
@@ -396,9 +399,69 @@ async def cancel_passkey_prompt(page: Page, log=print, timeout_seconds: int = 30
         await page.wait_for_timeout(1000)
 
 
+def dismiss_windows_security_passkey(log=print, timeout_seconds: int = 12) -> bool:
+    saw_possible_dialog = False
+    try:
+        from pywinauto import Desktop
+    except ImportError:
+        Desktop = None
+
+    deadline = time.monotonic() + timeout_seconds
+    title_patterns = [r"Windows 安全", r"Windows Security"]
+    cancel_patterns = [r"取消", r"Cancel"]
+    other_method_patterns = [r"选择其他通行密钥", r"Use a different passkey", r"其他"]
+    while time.monotonic() < deadline:
+        if Desktop:
+            desktop = Desktop(backend="uia")
+            for window in desktop.windows():
+                try:
+                    title = window.window_text()
+                    text = " ".join(item.window_text() for item in window.descendants()[:40])
+                    combined = f"{title} {text}"
+                    if not any(re.search(pattern, combined, re.I) for pattern in title_patterns):
+                        continue
+                    if not any(marker in combined for marker in ["密钥", "passkey", "PIN", "QR", "Windows Security"]):
+                        continue
+                    saw_possible_dialog = True
+                    for pattern in cancel_patterns:
+                        try:
+                            window.child_window(title_re=pattern, control_type="Button").click_input()
+                            log("Windows security passkey dialog cancelled.")
+                            return True
+                        except Exception:
+                            pass
+                    for pattern in other_method_patterns:
+                        try:
+                            window.child_window(title_re=pattern).click_input()
+                            log("Windows security passkey dialog switched to other method.")
+                            return True
+                        except Exception:
+                            pass
+                    try:
+                        window.close()
+                        log("Windows security passkey dialog closed.")
+                        return True
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        time.sleep(0.5)
+    if saw_possible_dialog:
+        try:
+            import pyautogui
+
+            pyautogui.press("esc")
+            log("Sent Escape to dismiss Windows security passkey dialog.")
+            return True
+        except Exception:
+            pass
+    return False
+
+
 async def wait_for_outlook_inbox(page: Page, log=print, timeout_seconds: int = 90) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
+        dismiss_windows_security_passkey(log, timeout_seconds=2)
         await cancel_passkey_prompt(page, log, timeout_seconds=5)
         try:
             url = page.url
@@ -732,6 +795,7 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
             try:
                 await logout_outlook(outlook_page)
                 await fill_login(outlook_page, account)
+                dismiss_windows_security_passkey(log, timeout_seconds=5)
                 if await security_challenge_visible(outlook_page):
                     await submit_security_email(outlook_page, args.security_email)
                     if args.security_code_source == "graph":
@@ -742,6 +806,7 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                         microsoft_code = await get_security_code(security_page, account.email, args.microsoft_code_timeout)
                     await submit_code(outlook_page, microsoft_code)
                 await cancel_passkey_prompt(outlook_page, log)
+                dismiss_windows_security_passkey(log, timeout_seconds=5)
                 await ensure_mailbox_loaded(outlook_page)
                 await wait_for_outlook_inbox(outlook_page, log)
 
@@ -860,6 +925,7 @@ def parse_args():
     parser.add_argument("--steam-login-timeout", type=int, default=180)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--start-row", type=int, help="Start from this sheet row and continue downward.")
+    parser.add_argument("--target-email", default="", help="Only process this exact Outlook/Hotmail email address.")
     parser.add_argument("--list-pending", action="store_true")
     parser.add_argument("--pause-between", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--continue-on-error", action="store_true")

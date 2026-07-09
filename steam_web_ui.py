@@ -81,6 +81,8 @@ HTML = r"""<!doctype html>
         <div><label>读取范围</label><input id="sheet_range" value="A1:I1000"></div>
         <div><label>限制数量</label><input id="limit" type="number" min="1" placeholder="空=全部"></div>
       </div>
+      <label>目标邮箱（可空；填写后只处理这个邮箱）</label>
+      <input id="target_email" placeholder="例如 furkan_galatasaray16@hotmail.com">
       <div class="row">
         <div><label>从此行开始向下</label><input id="start_row" type="number" min="2" placeholder="空=从第2行开始"></div>
         <div><label>安全邮箱</label><input id="security_email" value="__DEFAULT_SECURITY_EMAIL__"></div>
@@ -169,6 +171,7 @@ function settings() {
     outlook_x: Number(document.getElementById("outlook_x").value || 0),
     security_x: Number(document.getElementById("security_x").value || 1280),
     limit: limit ? Number(limit) : null
+    ,target_email: document.getElementById("target_email").value.trim()
     ,start_row: document.getElementById("start_row").value.trim() ? Number(document.getElementById("start_row").value.trim()) : null
     ,security_email: document.getElementById("security_email").value.trim()
     ,security_code_source: document.getElementById("security_code_source").value
@@ -259,6 +262,7 @@ def build_args(data: dict) -> argparse.Namespace:
         steam_ui_timeout=90,
         steam_login_timeout=180,
         limit=data.get("limit"),
+        target_email=data.get("target_email") or "",
         start_row=data.get("start_row"),
         list_pending=False,
         pause_between=True,
