@@ -88,7 +88,7 @@ HTML = r"""<!doctype html>
         <div><label>安全邮箱</label><input id="security_email" value="__DEFAULT_SECURITY_EMAIL__"></div>
       </div>
       <div class="row">
-        <div><label>安全验证码来源</label><select id="security_code_source"><option value="browser">手动网页登录</option><option value="graph">Microsoft Graph 多邮箱</option></select></div>
+        <div><label>安全验证码来源</label><select id="security_code_source"><option value="manual">手动处理验证</option><option value="graph">Microsoft Graph 多邮箱</option><option value="browser">安全邮箱网页登录</option></select></div>
         <div><label>Graph Client ID</label><input id="graph_client_id" placeholder="可留空使用 graph_config.json"></div>
       </div>
       <label>Graph 多邮箱配置</label>

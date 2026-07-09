@@ -775,7 +775,7 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
         if args.security_code_source == "browser":
             security_context, security_page = await connect_security_context(playwright, args)
             await wait_for_security_mailbox(security_page, args.security_email, log, pause_controller, on_manual_wait, on_manual_resume)
-        else:
+        elif args.security_code_source == "graph":
             if args.graph_all_accounts:
                 graph_accounts = graph_mail.load_accounts_config(Path(args.graph_accounts_config))
                 log(f"Graph security mailboxes loaded: {len(graph_accounts)}")
@@ -784,6 +784,8 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                 me = graph_mail.get_me(client_id, Path(args.graph_cache))
                 user_name = me.get("userPrincipalName") or me.get("mail") or ""
                 log(f"Graph security mailbox confirmed: {user_name}")
+        else:
+            log("Security verification source: manual. Security mailbox window will not be opened.")
 
         for idx, account in enumerate(accounts, start=1):
             if pause_controller and pause_controller.should_stop():
@@ -797,14 +799,26 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                 await fill_login(outlook_page, account)
                 dismiss_windows_security_passkey(log, timeout_seconds=5)
                 if await security_challenge_visible(outlook_page):
-                    await submit_security_email(outlook_page, args.security_email)
+                    if args.security_code_source == "manual":
+                        await wait_for_manual_continue(
+                            f"窗口1正在登录 {account.email}，页面需要安全验证。请你在窗口1手动完成验证，进入 Outlook 收件箱后回到 Web UI 点击“已完成人工操作 / 继续”。",
+                            log,
+                            pause_controller,
+                            on_manual_wait,
+                            on_manual_resume,
+                        )
+                    else:
+                        await submit_security_email(outlook_page, args.security_email)
                     if args.security_code_source == "graph":
                         microsoft_code = get_microsoft_security_code(args, account)
-                    else:
+                    elif args.security_code_source == "browser":
                         from outlook_batch_login import get_security_code
 
                         microsoft_code = await get_security_code(security_page, account.email, args.microsoft_code_timeout)
-                    await submit_code(outlook_page, microsoft_code)
+                    else:
+                        microsoft_code = ""
+                    if microsoft_code:
+                        await submit_code(outlook_page, microsoft_code)
                 await cancel_passkey_prompt(outlook_page, log)
                 dismiss_windows_security_passkey(log, timeout_seconds=5)
                 await ensure_mailbox_loaded(outlook_page)
@@ -907,7 +921,7 @@ def parse_args():
     parser.add_argument("--lark-mcp-root", default=str(feishu_tool.DEFAULT_LARK_MCP_ROOT))
     parser.add_argument("--steam-exe", help="Path to steam.exe. Auto-detected by default.")
     parser.add_argument("--security-email", default=DEFAULT_SECURITY_EMAIL)
-    parser.add_argument("--security-code-source", choices=["browser", "graph"], default="browser")
+    parser.add_argument("--security-code-source", choices=["browser", "graph", "manual"], default="manual")
     parser.add_argument("--graph-client-id")
     parser.add_argument("--graph-config", default=str(graph_mail.DEFAULT_CONFIG))
     parser.add_argument("--graph-cache", default=str(graph_mail.DEFAULT_CACHE))
