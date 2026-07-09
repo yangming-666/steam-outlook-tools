@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 import steam_outlook_batch
 
 
+APP_VERSION = "2026-07-09-1738"
 STATE_LOCK = threading.Lock()
 STATE = {
     "running": False,
@@ -79,7 +80,7 @@ HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <strong>Steam Outlook 自动化</strong>
+    <strong>Steam Outlook 自动化 <span style="font-size:12px;font-weight:400;color:#cbd5e1;">v__APP_VERSION__</span></strong>
     <div class="status"><span id="dot" class="dot"></span><span id="status">idle</span></div>
   </header>
   <main>
@@ -147,6 +148,7 @@ HTML = r"""<!doctype html>
       </div>
       <div class="actions">
         <button onclick="loadPending()">刷新队列</button>
+        <button onclick="debugService()">服务自检</button>
         <button onclick="feishuLogin()">飞书重新授权</button>
         <button onclick="graphLoginSecurity()">安全邮箱 API 授权</button>
         <button onclick="graphLoginTarget()">目标邮箱 API 授权</button>
@@ -202,6 +204,15 @@ async function callAction(path, body) {
   }
   refresh();
 }
+function localNotice(text) {
+  document.getElementById("status").textContent = "working";
+  const msg = document.getElementById("message");
+  msg.textContent = text;
+  msg.style.display = "block";
+  const logs = document.getElementById("logs");
+  logs.textContent += (logs.textContent ? "\n" : "") + new Date().toLocaleTimeString() + " " + text;
+  logs.scrollTop = logs.scrollHeight;
+}
 function settings() {
   const limit = document.getElementById("limit").value.trim();
   const taskMode = document.getElementById("task_mode").value;
@@ -250,15 +261,16 @@ function applyTaskMode() {
     document.getElementById("enable_target_graph_login").value = "0";
   }
 }
-async function loadPending(){ await callAction("/api/pending", settings()); }
-async function startRun(){ await callAction("/api/start", settings()); }
-async function feishuLogin(){ await callAction("/api/feishu-login", {}); }
-async function graphLoginSecurity(){ const s = settings(); await callAction("/api/graph-login", {email:s.security_email, graph_client_id:s.graph_client_id, graph_accounts_config:s.graph_accounts_config}); }
-async function graphLoginTarget(){ const s = settings(); await callAction("/api/graph-login", {email:s.target_email, graph_client_id:s.graph_client_id, graph_accounts_config:s.graph_accounts_config}); }
-async function continueNext(){ await callAction("/api/continue", {}); }
-async function dotaFound(){ await callAction("/api/dota-found", {}); }
-async function dotaNotFound(){ await callAction("/api/dota-not-found", {}); }
-async function stopRun(){ await callAction("/api/stop", {}); }
+async function loadPending(){ localNotice("已点击刷新队列，正在请求后端..."); await callAction("/api/pending", settings()); }
+async function startRun(){ localNotice("已点击启动，正在请求后端..."); await callAction("/api/start", settings()); }
+async function debugService(){ localNotice("正在执行服务自检..."); await callAction("/api/debug", {}); }
+async function feishuLogin(){ localNotice("已点击飞书重新授权，正在请求后端..."); await callAction("/api/feishu-login", {}); }
+async function graphLoginSecurity(){ const s = settings(); localNotice("已点击安全邮箱 API 授权，正在请求后端..."); await callAction("/api/graph-login", {email:s.security_email, graph_client_id:s.graph_client_id, graph_accounts_config:s.graph_accounts_config}); }
+async function graphLoginTarget(){ const s = settings(); localNotice("已点击目标邮箱 API 授权，正在请求后端..."); await callAction("/api/graph-login", {email:s.target_email, graph_client_id:s.graph_client_id, graph_accounts_config:s.graph_accounts_config}); }
+async function continueNext(){ localNotice("已点击继续，正在通知后端..."); await callAction("/api/continue", {}); }
+async function dotaFound(){ localNotice("已点击 Dota 找到了，正在通知后端..."); await callAction("/api/dota-found", {}); }
+async function dotaNotFound(){ localNotice("已点击 Dota 没找到，正在通知后端..."); await callAction("/api/dota-not-found", {}); }
+async function stopRun(){ localNotice("已点击停止，正在通知后端..."); await callAction("/api/stop", {}); }
 async function refresh(){
   let s;
   try {
@@ -290,7 +302,7 @@ refresh();
 </script>
 </body>
 </html>
-""".replace("__DEFAULT_URL__", steam_outlook_batch.DEFAULT_FEISHU_SHEET_URL).replace(
+""".replace("__APP_VERSION__", APP_VERSION).replace("__DEFAULT_URL__", steam_outlook_batch.DEFAULT_FEISHU_SHEET_URL).replace(
     "__DEFAULT_SECURITY_EMAIL__", steam_outlook_batch.DEFAULT_SECURITY_EMAIL
 )
 
@@ -509,6 +521,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -529,6 +542,7 @@ class Handler(BaseHTTPRequestHandler):
             raw = HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
@@ -589,6 +603,14 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["finished_at"] = None
             RUN_THREAD.start()
             self._json({"ok": True})
+            return
+        if path == "/api/debug":
+            with STATE_LOCK:
+                STATE["status"] = "debug ok"
+                STATE["message"] = f"服务自检正常：版本 {APP_VERSION}，后端 API 可用。"
+                snapshot = dict(STATE)
+            append_log(f"debug ok: {APP_VERSION}")
+            self._json({"ok": True, "version": APP_VERSION, "state": snapshot})
             return
         if path == "/api/feishu-login":
             try:
