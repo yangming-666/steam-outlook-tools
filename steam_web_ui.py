@@ -82,14 +82,14 @@ HTML = r"""<!doctype html>
       <select id="task_mode" onchange="applyTaskMode()">
         <option value="full">1. 登录新邮箱 / 登录 Steam / 测 Dota2 / 更新飞书</option>
         <option value="mail_password">2. 绑定安全邮箱 / 改邮箱密码 / 可开启 API 登录</option>
-        <option value="graph_credential">3. 已测 Steam 的邮箱补 API 凭据</option>
+        <option value="graph_credential">3. 已测 Steam 的邮箱补 API凭据</option>
       </select>
       <div class="subsection">
       <h3>通用配置</h3>
       <label>飞书表格链接</label>
       <input id="sheet_url">
       <div class="row">
-        <div><label>读取范围</label><input id="sheet_range" value="A1:J1000"></div>
+        <div><label>读取范围</label><input id="sheet_range" value="A1:K1000"></div>
         <div><label>限制数量</label><input id="limit" type="number" min="1" placeholder="空=全部"></div>
       </div>
       <label>目标邮箱（可空；填写后只处理这个邮箱）</label>
@@ -128,13 +128,15 @@ HTML = r"""<!doctype html>
       </div>
       <label>绑定安全邮箱（可空；开启邮箱安全维护后生效）</label>
       <input id="bind_security_email" placeholder="例如 security@example.com">
+      <label>回填规则</label>
+      <input value="绑定确认后写入 J 列“备用安全邮箱”；改密后写入 D 列“密码”；API 授权后写入 K 列“API凭据”。" disabled>
       <label>新邮箱密码（可空；留空自动生成并在提示中显示）</label>
       <input id="new_email_password" placeholder="空=每个账号自动生成">
       </div>
       <div class="subsection" data-section="graph_credential">
-      <h3>功能3：补邮箱 API 凭据</h3>
+      <h3>功能3：补邮箱 API凭据</h3>
       <label>处理规则</label>
-      <input value="读取已有 steam id 且“凭据”为空的行；只做 Microsoft Graph 授权并写入 J 列“凭据”。" disabled>
+      <input value="读取已有 steam id 且 K 列“API凭据”为空的行；只做 Microsoft Graph 授权并写入 K 列。" disabled>
       </div>
       <div class="actions">
         <button onclick="loadPending()">刷新队列</button>
@@ -299,7 +301,7 @@ def build_args(data: dict) -> argparse.Namespace:
         task_mode=task_mode,
         sheet_url=data.get("sheet_url") or steam_outlook_batch.DEFAULT_FEISHU_SHEET_URL,
         sheet_id=None,
-        sheet_range=data.get("sheet_range") or "A1:J1000",
+        sheet_range=data.get("sheet_range") or "A1:K1000",
         feishu_auth=data.get("feishu_auth") or "user",
         feishu_config=str(steam_outlook_batch.feishu_tool.DEFAULT_CONFIG),
         feishu_start_script=str(steam_outlook_batch.feishu_tool.DEFAULT_START_SCRIPT),

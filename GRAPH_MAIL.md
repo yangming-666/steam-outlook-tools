@@ -67,5 +67,6 @@ python graph_mail.py security-code target@example.com --all-accounts --timeout 1
 - `安全邮箱 API 授权`：对“安全邮箱”输入框中的邮箱执行 Graph OAuth，成功后写入 `graph_accounts.json`。
 - `目标邮箱 API 授权`：对“目标邮箱”输入框中的邮箱执行 Graph OAuth。
 - `目标邮箱 API 登录` 开关：开启后，主流程在完成“绑定安全邮箱/改邮箱密码”后，会立即为当前目标邮箱执行 Graph OAuth，并保存到 `graph_accounts.json`。
+- Sheet 回填列：绑定确认后写 `J 列 备用安全邮箱`；Graph OAuth 成功后写 `K 列 API凭据`。
 
 注意：Microsoft Graph OAuth 不能只靠账号密码静默开启，必须人工完成 Microsoft 授权页面或 device code 确认。

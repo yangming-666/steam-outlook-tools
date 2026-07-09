@@ -35,8 +35,10 @@ from outlook_batch_login import (
 STEAM_ID_COL = "I"
 BIG_ACCOUNT_COL = "G"
 EMAIL_PASSWORD_COL = "D"
-GRAPH_CREDENTIAL_COL = "J"
-GRAPH_CREDENTIAL_HEADER = "凭据"
+BACKUP_SECURITY_EMAIL_COL = "J"
+BACKUP_SECURITY_EMAIL_HEADER = "备用安全邮箱"
+GRAPH_CREDENTIAL_COL = "K"
+GRAPH_CREDENTIAL_HEADER = "API凭据"
 STEAM_GUARD_CODE_RE = re.compile(r"\b[A-Z0-9]{5}\b")
 
 
@@ -148,6 +150,18 @@ def ensure_graph_credential_header(args, feishu_config: dict[str, Any], spreadsh
         sheet_id,
         f"{GRAPH_CREDENTIAL_COL}1:{GRAPH_CREDENTIAL_COL}1",
         [[GRAPH_CREDENTIAL_HEADER]],
+        use_uat=args.feishu_auth == "user",
+        package_root=Path(args.lark_mcp_root),
+    )
+
+
+def ensure_backup_security_email_header(args, feishu_config: dict[str, Any], spreadsheet_token: str, sheet_id: str) -> None:
+    feishu_tool.write_sheet(
+        feishu_config,
+        spreadsheet_token,
+        sheet_id,
+        f"{BACKUP_SECURITY_EMAIL_COL}1:{BACKUP_SECURITY_EMAIL_COL}1",
+        [[BACKUP_SECURITY_EMAIL_HEADER]],
         use_uat=args.feishu_auth == "user",
         package_root=Path(args.lark_mcp_root),
     )
@@ -312,6 +326,45 @@ def extract_steam_guard_code(text: str) -> str | None:
         if candidate not in ignored:
             return candidate
     return None
+
+
+def parse_graph_credential(value: str) -> tuple[str | None, Path | None]:
+    if not value:
+        return None, None
+    parts = {}
+    for item in value.split(";"):
+        if ":" not in item:
+            continue
+        key, raw = item.split(":", 1)
+        parts[key.strip().casefold()] = raw.strip()
+    email = parts.get("graph")
+    cache = parts.get("cache")
+    return email, Path(cache) if cache else None
+
+
+def search_steam_guard_mail_graph(account: SteamAccount, args, timeout_seconds: int, log=print) -> str:
+    credential_email, cache_path = parse_graph_credential(account.graph_credential)
+    if not credential_email or not cache_path:
+        raise RuntimeError(f"Row {account.row_number} has no API credential.")
+    if credential_email.casefold() != account.email.casefold():
+        raise RuntimeError(f"API credential email mismatch: row={account.email}, credential={credential_email}")
+    client_id = graph_mail.load_client_id(Path(args.graph_config), args.graph_client_id)
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        messages = graph_mail.recent_messages(client_id, cache_path, top=30)
+        for message in messages:
+            text = graph_mail.message_text(message)
+            lower = text.casefold()
+            subject = str(message.get("subject") or "").casefold()
+            sender = ((message.get("from") or {}).get("emailAddress") or {}).get("address", "").casefold()
+            if "steam" not in lower and "steam" not in subject and "steam" not in sender:
+                continue
+            code = extract_steam_guard_code(text)
+            if code:
+                log(f"Steam Guard code found by Graph API for {account.email}")
+                return code
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting for Steam Guard email code by Graph API for {account.email}.")
 
 
 async def search_steam_guard_mail(page: Page, steam_username: str, timeout_seconds: int) -> str:
@@ -629,6 +682,17 @@ async def run_mail_security_maintenance(
             on_manual_wait,
             on_manual_resume,
         )
+        ensure_backup_security_email_header(args, feishu_config, spreadsheet_token, sheet_id)
+        feishu_tool.write_sheet(
+            feishu_config,
+            spreadsheet_token,
+            sheet_id,
+            f"{BACKUP_SECURITY_EMAIL_COL}{account.row_number}:{BACKUP_SECURITY_EMAIL_COL}{account.row_number}",
+            [[bind_email]],
+            use_uat=args.feishu_auth == "user",
+            package_root=Path(args.lark_mcp_root),
+        )
+        log(f"Wrote backup security email to row {account.row_number} column {BACKUP_SECURITY_EMAIL_COL}: {bind_email}")
 
     submitted = await try_change_microsoft_password(page, account.email_password, new_password, log)
     if submitted:
@@ -886,10 +950,10 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
         outlook_page = await outlook_context.new_page()
         await show_window_instruction(
             outlook_page,
-            "窗口1：目标 Outlook / Steam 验证码",
+            "窗口1：目标 Outlook / 辅助操作",
             [
-                "这个窗口由程序自动退出当前 Microsoft 账号，然后登录飞书当前行的 Hotmail/Outlook 邮箱。",
-                "登录成功后，程序会在这里收取 Steam Guard 邮件验证码。",
+                "如果当前行已有 API凭据，程序会优先用 Graph API 收取 Steam Guard 邮件验证码，不再网页登录邮箱收码。",
+                "如果没有 API凭据，或正在执行邮箱改密/绑定安全邮箱，才会使用这个窗口登录目标 Hotmail/Outlook。",
                 "如果页面要求人工验证、绑定安全邮箱或改邮箱密码，请按 localhost 控制台提示操作。",
             ],
         )
@@ -918,34 +982,38 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
             on_account_start(account, idx, len(accounts))
             log(f"[{idx}/{len(accounts)}] row {account.row_number}: steam={account.steam_username}, email={account.email}")
             try:
-                await logout_outlook(outlook_page)
-                await fill_login(outlook_page, account)
-                dismiss_windows_security_passkey(log, timeout_seconds=5)
-                if await security_challenge_visible(outlook_page):
-                    if args.security_code_source == "manual":
-                        await wait_for_manual_continue(
-                            f"窗口1正在登录 {account.email}，页面需要安全验证。请你在窗口1手动完成验证，进入 Outlook 收件箱后回到 Web UI 点击“已完成人工操作 / 继续”。",
-                            log,
-                            pause_controller,
-                            on_manual_wait,
-                            on_manual_resume,
-                        )
-                    else:
-                        await submit_security_email(outlook_page, args.security_email)
-                    if args.security_code_source == "graph":
-                        microsoft_code = get_microsoft_security_code(args, account)
-                    elif args.security_code_source == "browser":
-                        from outlook_batch_login import get_security_code
+                need_outlook_login = args.enable_mail_maintenance or (args.enable_steam_login and not account.graph_credential)
+                if need_outlook_login:
+                    await logout_outlook(outlook_page)
+                    await fill_login(outlook_page, account)
+                    dismiss_windows_security_passkey(log, timeout_seconds=5)
+                    if await security_challenge_visible(outlook_page):
+                        if args.security_code_source == "manual":
+                            await wait_for_manual_continue(
+                                f"窗口1正在登录 {account.email}，页面需要安全验证。请你在窗口1手动完成验证，进入 Outlook 收件箱后回到 Web UI 点击“已完成人工操作 / 继续”。",
+                                log,
+                                pause_controller,
+                                on_manual_wait,
+                                on_manual_resume,
+                            )
+                        else:
+                            await submit_security_email(outlook_page, args.security_email)
+                        if args.security_code_source == "graph":
+                            microsoft_code = get_microsoft_security_code(args, account)
+                        elif args.security_code_source == "browser":
+                            from outlook_batch_login import get_security_code
 
-                        microsoft_code = await get_security_code(security_page, account.email, args.microsoft_code_timeout)
-                    else:
-                        microsoft_code = ""
-                    if microsoft_code:
-                        await submit_code(outlook_page, microsoft_code)
-                await cancel_passkey_prompt(outlook_page, log)
-                dismiss_windows_security_passkey(log, timeout_seconds=5)
-                await ensure_mailbox_loaded(outlook_page)
-                await wait_for_outlook_inbox(outlook_page, log)
+                            microsoft_code = await get_security_code(security_page, account.email, args.microsoft_code_timeout)
+                        else:
+                            microsoft_code = ""
+                        if microsoft_code:
+                            await submit_code(outlook_page, microsoft_code)
+                    await cancel_passkey_prompt(outlook_page, log)
+                    dismiss_windows_security_passkey(log, timeout_seconds=5)
+                    await ensure_mailbox_loaded(outlook_page)
+                    await wait_for_outlook_inbox(outlook_page, log)
+                else:
+                    log(f"Using API credential for mailbox code retrieval: {account.email}")
 
                 if args.enable_mail_maintenance:
                     await run_mail_security_maintenance(
@@ -976,7 +1044,10 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                 if args.enable_steam_login:
                     shutdown_steam(steam_exe)
                     start_steam_login(steam_exe, account)
-                    steam_code = await search_steam_guard_mail(outlook_page, account.steam_username, args.steam_code_timeout)
+                    if account.graph_credential:
+                        steam_code = await asyncio.to_thread(search_steam_guard_mail_graph, account, args, args.steam_code_timeout, log)
+                    else:
+                        steam_code = await search_steam_guard_mail(outlook_page, account.steam_username, args.steam_code_timeout)
                     log(f"Steam Guard code found: {steam_code}")
                     if not send_guard_code_to_steam(steam_code, args.steam_ui_timeout):
                         raise TimeoutError("Could not find Steam Guard code input window.")
@@ -1048,12 +1119,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Login Outlook/Steam accounts, fetch verification codes, and write results to Feishu sheet.")
     parser.add_argument("--sheet-url", default=DEFAULT_FEISHU_SHEET_URL)
     parser.add_argument("--sheet-id")
-    parser.add_argument("--sheet-range", default="A1:J1000")
+    parser.add_argument("--sheet-range", default="A1:K1000")
     parser.add_argument(
         "--task-mode",
         choices=["full", "mail_password", "graph_credential"],
         default="full",
-        help="full=login mailbox/Steam/Dota; mail_password=bind security email/change mailbox password; graph_credential=only save Microsoft Graph credential.",
+        help="full=login mailbox/Steam/Dota; mail_password=bind security email/change mailbox password; graph_credential=only save Microsoft Graph API credential.",
     )
     parser.add_argument("--feishu-auth", choices=["user", "app"], default="user")
     parser.add_argument("--feishu-config", default=str(feishu_tool.DEFAULT_CONFIG))
