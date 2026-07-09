@@ -61,3 +61,11 @@ python graph_mail.py security-code target@example.com --all-accounts --timeout 1
 ```
 
 自动化主流程在 Web UI 选择 `Microsoft Graph 多邮箱` 后，会读取 `graph_accounts.json` 中所有安全邮箱并查找匹配验证码。优先使用邮件正文中包含目标 Hotmail 地址的验证码；如果微软邮件没有写目标地址，则使用最新可识别的 Microsoft 安全验证码作为兜底。
+
+## Web UI 用法
+
+- `安全邮箱 API 授权`：对“安全邮箱”输入框中的邮箱执行 Graph OAuth，成功后写入 `graph_accounts.json`。
+- `目标邮箱 API 授权`：对“目标邮箱”输入框中的邮箱执行 Graph OAuth。
+- `目标邮箱 API 登录` 开关：开启后，主流程在完成“绑定安全邮箱/改邮箱密码”后，会立即为当前目标邮箱执行 Graph OAuth，并保存到 `graph_accounts.json`。
+
+注意：Microsoft Graph OAuth 不能只靠账号密码静默开启，必须人工完成 Microsoft 授权页面或 device code 确认。

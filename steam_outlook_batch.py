@@ -625,6 +625,33 @@ async def run_mail_security_maintenance(
     log(f"Wrote new email password to row {account.row_number} column {EMAIL_PASSWORD_COL}.")
 
 
+async def run_graph_api_login(
+    args,
+    email: str,
+    log,
+    pause_controller=None,
+    on_manual_wait=lambda message: None,
+    on_manual_resume=lambda message: None,
+) -> None:
+    client_id = graph_mail.load_client_id(Path(args.graph_config), args.graph_client_id)
+    cache_path = Path(graph_mail.safe_cache_name(email))
+    app, cache, flow = graph_mail.begin_login_flow(client_id, cache_path)
+    message = (
+        f"正在为 {email} 开启 Microsoft Graph API 登录。\n"
+        f"{flow.get('message') or ''}\n"
+        "请按上面的链接/代码完成 Microsoft 授权。授权完成后程序会自动继续；如果长时间无响应，可点停止。"
+    )
+    log(message)
+    on_manual_wait(message)
+    try:
+        result = await asyncio.to_thread(graph_mail.complete_login_flow, app, cache, flow, cache_path)
+    finally:
+        on_manual_resume(f"Graph API login finished for {email}")
+    account_email = result.get("id_token_claims", {}).get("preferred_username") or email
+    graph_mail.save_account_config(Path(args.graph_accounts_config), account_email, client_id, cache_path)
+    log(f"Graph API login saved: {account_email} -> {cache_path}")
+
+
 async def verify_security_mailbox(page: Page, security_email: str) -> bool:
     expected = security_email.casefold()
     try:
@@ -837,6 +864,15 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                         on_manual_wait,
                         on_manual_resume,
                     )
+                    if args.enable_target_graph_login:
+                        await run_graph_api_login(
+                            args,
+                            account.email,
+                            log,
+                            pause_controller,
+                            on_manual_wait,
+                            on_manual_resume,
+                        )
 
                 steam_id = ""
                 if args.enable_steam_login:
@@ -950,6 +986,7 @@ def parse_args():
     parser.add_argument("--enable-mail-maintenance", action="store_true", help="Bind security email and change target email password after Outlook login.")
     parser.add_argument("--bind-security-email", default="", help="Security email to bind on the target Microsoft account. Empty skips binding prompt.")
     parser.add_argument("--new-email-password", default="", help="New target email password. Empty generates a strong password per account.")
+    parser.add_argument("--enable-target-graph-login", action="store_true", help="After mail maintenance, run Microsoft Graph OAuth for the target mailbox and save it to graph_accounts.json.")
     return parser.parse_args()
 
 

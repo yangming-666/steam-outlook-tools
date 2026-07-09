@@ -29,6 +29,7 @@ STATE = {
 RUN_THREAD: threading.Thread | None = None
 PAUSE_CONTROLLER: steam_outlook_batch.PauseController | None = None
 FEISHU_LOGIN_THREAD: threading.Thread | None = None
+GRAPH_LOGIN_THREAD: threading.Thread | None = None
 
 
 HTML = r"""<!doctype html>
@@ -88,7 +89,7 @@ HTML = r"""<!doctype html>
         <div><label>安全邮箱</label><input id="security_email" value="__DEFAULT_SECURITY_EMAIL__"></div>
       </div>
       <div class="row">
-        <div><label>安全验证码来源</label><select id="security_code_source"><option value="manual">手动处理验证</option><option value="graph">Microsoft Graph 多邮箱</option><option value="browser">安全邮箱网页登录</option></select></div>
+        <div><label>安全验证码来源</label><select id="security_code_source"><option value="graph">Microsoft Graph 多邮箱</option><option value="manual">手动处理验证</option><option value="browser">安全邮箱网页登录</option></select></div>
         <div><label>Graph Client ID</label><input id="graph_client_id" placeholder="可留空使用 graph_config.json"></div>
       </div>
       <label>Graph 多邮箱配置</label>
@@ -107,8 +108,10 @@ HTML = r"""<!doctype html>
       </div>
       <div class="row">
         <div><label>邮箱安全维护</label><select id="enable_mail_maintenance"><option value="0">关闭</option><option value="1">开启</option></select></div>
-        <div><label>Dota 最多开房次数</label><input id="dota_max_attempts" type="number" min="1" max="5" value="3"></div>
+        <div><label>目标邮箱 API 登录</label><select id="enable_target_graph_login"><option value="0">关闭</option><option value="1">开启</option></select></div>
       </div>
+      <label>Dota 最多开房次数</label>
+      <input id="dota_max_attempts" type="number" min="1" max="5" value="3">
       <label>绑定安全邮箱（可空；开启邮箱安全维护后生效）</label>
       <input id="bind_security_email" placeholder="例如 security@example.com">
       <label>新邮箱密码（可空；留空自动生成并在提示中显示）</label>
@@ -116,6 +119,8 @@ HTML = r"""<!doctype html>
       <div class="actions">
         <button onclick="loadPending()">刷新队列</button>
         <button onclick="feishuLogin()">飞书重新授权</button>
+        <button onclick="graphLoginSecurity()">安全邮箱 API 授权</button>
+        <button onclick="graphLoginTarget()">目标邮箱 API 授权</button>
         <button class="primary" onclick="startRun()">启动</button>
         <button onclick="continueNext()">已完成人工操作 / 继续</button>
         <button onclick="dotaFound()">Dota 找到了</button>
@@ -188,6 +193,7 @@ function settings() {
     ,enable_dota_check: document.getElementById("enable_dota_check").value === "1"
     ,dota_max_attempts: Number(document.getElementById("dota_max_attempts").value || 3)
     ,enable_mail_maintenance: document.getElementById("enable_mail_maintenance").value === "1"
+    ,enable_target_graph_login: document.getElementById("enable_target_graph_login").value === "1"
     ,bind_security_email: document.getElementById("bind_security_email").value.trim()
     ,new_email_password: document.getElementById("new_email_password").value.trim()
   };
@@ -195,6 +201,8 @@ function settings() {
 async function loadPending(){ await callAction("/api/pending", settings()); }
 async function startRun(){ await callAction("/api/start", settings()); }
 async function feishuLogin(){ await callAction("/api/feishu-login", {}); }
+async function graphLoginSecurity(){ const s = settings(); await callAction("/api/graph-login", {email:s.security_email, graph_client_id:s.graph_client_id, graph_accounts_config:s.graph_accounts_config}); }
+async function graphLoginTarget(){ const s = settings(); await callAction("/api/graph-login", {email:s.target_email, graph_client_id:s.graph_client_id, graph_accounts_config:s.graph_accounts_config}); }
 async function continueNext(){ await callAction("/api/continue", {}); }
 async function dotaFound(){ await callAction("/api/dota-found", {}); }
 async function dotaNotFound(){ await callAction("/api/dota-not-found", {}); }
@@ -252,7 +260,7 @@ def build_args(data: dict) -> argparse.Namespace:
         lark_mcp_root=str(steam_outlook_batch.feishu_tool.DEFAULT_LARK_MCP_ROOT),
         steam_exe=data.get("steam_exe") or None,
         security_email=data.get("security_email") or steam_outlook_batch.DEFAULT_SECURITY_EMAIL,
-        security_code_source=data.get("security_code_source") or "browser",
+        security_code_source=data.get("security_code_source") or "graph",
         graph_client_id=data.get("graph_client_id") or None,
         graph_config=str(steam_outlook_batch.graph_mail.DEFAULT_CONFIG),
         graph_cache=str(steam_outlook_batch.graph_mail.DEFAULT_CACHE),
@@ -279,6 +287,7 @@ def build_args(data: dict) -> argparse.Namespace:
         enable_dota_check=bool(data.get("enable_dota_check")),
         dota_max_attempts=int(data.get("dota_max_attempts") or 3),
         enable_mail_maintenance=bool(data.get("enable_mail_maintenance")),
+        enable_target_graph_login=bool(data.get("enable_target_graph_login")),
         bind_security_email=data.get("bind_security_email") or "",
         new_email_password=data.get("new_email_password") or "",
     )
@@ -393,6 +402,44 @@ def feishu_login_worker() -> None:
             STATE["message"] = f"飞书授权失败：{exc}"
 
 
+def graph_login_worker(email: str, graph_client_id: str | None, accounts_config: str) -> None:
+    email = (email or "").strip()
+    if not email:
+        with STATE_LOCK:
+            STATE["status"] = "graph login failed"
+            STATE["message"] = "缺少邮箱。请先填写安全邮箱或目标邮箱。"
+        return
+    append_log(f"Graph API login started: {email}")
+    try:
+        client_id = steam_outlook_batch.graph_mail.load_client_id(
+            steam_outlook_batch.graph_mail.DEFAULT_CONFIG,
+            graph_client_id or None,
+        )
+        cache_path = Path(steam_outlook_batch.graph_mail.safe_cache_name(email))
+        app, cache, flow = steam_outlook_batch.graph_mail.begin_login_flow(client_id, cache_path)
+        message = (
+            f"正在为 {email} 开启 Microsoft Graph API 登录。\n"
+            f"{flow.get('message') or ''}\n"
+            "请完成浏览器/device code 授权；成功后页面会自动更新。"
+        )
+        append_log(message)
+        with STATE_LOCK:
+            STATE["status"] = "graph login"
+            STATE["message"] = message
+        result = steam_outlook_batch.graph_mail.complete_login_flow(app, cache, flow, cache_path)
+        account_email = result.get("id_token_claims", {}).get("preferred_username") or email
+        steam_outlook_batch.graph_mail.save_account_config(Path(accounts_config or "graph_accounts.json"), account_email, client_id, cache_path)
+        append_log(f"Graph API login saved: {account_email}")
+        with STATE_LOCK:
+            STATE["status"] = "graph login ok"
+            STATE["message"] = f"{account_email} 的 API 登录已保存到 {accounts_config or 'graph_accounts.json'}。"
+    except Exception as exc:
+        append_log(f"Graph API login failed: {exc}")
+        with STATE_LOCK:
+            STATE["status"] = "graph login failed"
+            STATE["message"] = f"API 登录失败：{exc}"
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, data, status=200):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -428,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        global RUN_THREAD, PAUSE_CONTROLLER, FEISHU_LOGIN_THREAD
+        global RUN_THREAD, PAUSE_CONTROLLER, FEISHU_LOGIN_THREAD, GRAPH_LOGIN_THREAD
         path = urlparse(self.path).path
         if path == "/api/state":
             with STATE_LOCK:
@@ -475,6 +522,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True})
             except Exception as exc:
                 append_log(f"feishu login failed: {exc}")
+                self._json({"ok": False, "error": str(exc)}, 500)
+            return
+        if path == "/api/graph-login":
+            data = self._body()
+            try:
+                if GRAPH_LOGIN_THREAD and GRAPH_LOGIN_THREAD.is_alive():
+                    self._json({"ok": False, "error": "Graph API 授权正在进行中"}, 409)
+                    return
+                GRAPH_LOGIN_THREAD = threading.Thread(
+                    target=graph_login_worker,
+                    args=(data.get("email") or "", data.get("graph_client_id") or None, data.get("graph_accounts_config") or "graph_accounts.json"),
+                    daemon=True,
+                )
+                GRAPH_LOGIN_THREAD.start()
+                self._json({"ok": True})
+            except Exception as exc:
+                append_log(f"graph login start failed: {exc}")
                 self._json({"ok": False, "error": str(exc)}, 500)
             return
         if path == "/api/continue":

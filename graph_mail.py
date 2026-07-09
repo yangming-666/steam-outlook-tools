@@ -57,18 +57,27 @@ def build_app(client_id: str, cache):
     return msal.PublicClientApplication(client_id=client_id, authority=AUTHORITY, token_cache=cache)
 
 
-def login(client_id: str, cache_path: Path) -> dict[str, Any]:
+def begin_login_flow(client_id: str, cache_path: Path) -> tuple[Any, Any, dict[str, Any]]:
     cache = load_cache(cache_path)
     app = build_app(client_id, cache)
     flow = app.initiate_device_flow(scopes=SCOPES)
     if "user_code" not in flow:
         raise GraphMailError(f"Failed to create device flow: {flow}")
-    print(flow["message"])
+    return app, cache, flow
+
+
+def complete_login_flow(app, cache, flow: dict[str, Any], cache_path: Path) -> dict[str, Any]:
     result = app.acquire_token_by_device_flow(flow)
     save_cache(cache, cache_path)
     if "access_token" not in result:
         raise GraphMailError(json.dumps(result, ensure_ascii=False))
     return result
+
+
+def login(client_id: str, cache_path: Path) -> dict[str, Any]:
+    app, cache, flow = begin_login_flow(client_id, cache_path)
+    print(flow["message"], flush=True)
+    return complete_login_flow(app, cache, flow, cache_path)
 
 
 def get_token(client_id: str, cache_path: Path) -> str:
