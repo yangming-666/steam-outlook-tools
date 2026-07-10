@@ -2,6 +2,7 @@ import argparse
 import html
 import json
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ from urllib.request import Request, urlopen
 DEFAULT_CACHE = Path(".graph-token-cache.bin")
 DEFAULT_CONFIG = Path("graph_config.json")
 DEFAULT_ACCOUNTS_CONFIG = Path("graph_accounts.json")
-SCOPES = ["Mail.Read", "offline_access", "User.Read"]
+SCOPES = ["Mail.Read", "User.Read"]
 AUTHORITY = "https://login.microsoftonline.com/consumers"
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 
@@ -21,14 +22,29 @@ class GraphMailError(RuntimeError):
     pass
 
 
+def validate_client_id(client_id: str, source: str = "Microsoft Graph client_id") -> str:
+    value = (client_id or "").strip()
+    if not value:
+        raise GraphMailError(f"Missing {source}.")
+    if "PASTE_YOUR" in value or "YOUR_CLIENT_ID" in value or value in {"你的 client id", "client_id"}:
+        raise GraphMailError(f"{source} still contains the sample placeholder. Paste the real Microsoft Entra application client_id.")
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", value):
+        raise GraphMailError(f"Invalid {source}: expected a Microsoft Entra application client_id GUID.")
+    return value
+
+
 def load_client_id(config_path: Path = DEFAULT_CONFIG, client_id: str | None = None) -> str:
     if client_id:
-        return client_id
+        return validate_client_id(client_id, "--client-id")
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         if data.get("client_id"):
-            return data["client_id"]
-    raise GraphMailError(f"Missing Microsoft Graph client_id. Create {config_path} or pass --client-id.")
+            return validate_client_id(data["client_id"], f"{config_path} client_id")
+    raise GraphMailError(
+        f"Missing Microsoft Graph client_id for the legacy standalone Graph tool. "
+        f"Create {config_path} from graph_config.sample.json if you intentionally run graph_mail.py. "
+        "The Steam Outlook Web UI task flows no longer use Graph."
+    )
 
 
 def import_msal():
@@ -62,8 +78,28 @@ def begin_login_flow(client_id: str, cache_path: Path) -> tuple[Any, Any, dict[s
     app = build_app(client_id, cache)
     flow = app.initiate_device_flow(scopes=SCOPES)
     if "user_code" not in flow:
-        raise GraphMailError(f"Failed to create device flow: {flow}")
+        description = flow.get("error_description") or flow.get("error") or str(flow)
+        error_uri = flow.get("error_uri")
+        if error_uri:
+            description = f"{description}\n{error_uri}"
+        raise GraphMailError(f"Failed to create device flow: {description}")
     return app, cache, flow
+
+
+def device_flow_message(email: str, flow: dict[str, Any]) -> str:
+    verification_uri = flow.get("verification_uri") or flow.get("verification_url") or "https://microsoft.com/devicelogin"
+    user_code = flow.get("user_code") or ""
+    expires_in = flow.get("expires_in")
+    lines = [
+        f"正在为 {email} 开启 Microsoft Graph API 登录。",
+        f"打开授权页面：{verification_uri}",
+    ]
+    if user_code:
+        lines.append(f"输入代码：{user_code}")
+    if expires_in:
+        lines.append(f"代码有效期：约 {int(expires_in) // 60} 分钟")
+    lines.append("授权完成后程序会自动继续；如果长时间无响应，可点停止。")
+    return "\n".join(lines)
 
 
 def complete_login_flow(app, cache, flow: dict[str, Any], cache_path: Path) -> dict[str, Any]:
@@ -111,7 +147,7 @@ def load_accounts_config(path: Path = DEFAULT_ACCOUNTS_CONFIG) -> list[dict[str,
         cache = account.get("cache") or safe_cache_name(email or "default")
         if not email or not client_id:
             raise GraphMailError(f"Each Graph account needs email and client_id: {account}")
-        normalized.append({"email": email, "client_id": client_id, "cache": cache})
+        normalized.append({"email": email, "client_id": validate_client_id(client_id, f"{path} account client_id"), "cache": cache})
     return normalized
 
 
@@ -253,6 +289,78 @@ def find_security_code_across_accounts(accounts: list[dict[str, Any]], target_em
     raise TimeoutError(f"Timed out waiting for Microsoft security code for {target_email} in {len(accounts)} mailboxes.")
 
 
+def parse_graph_credential(credential: str) -> dict[str, str]:
+    parts: dict[str, str] = {}
+    for item in (credential or "").split(";"):
+        if ":" not in item:
+            continue
+        key, value = item.split(":", 1)
+        parts[key.strip()] = value.strip()
+    email = parts.get("graph")
+    cache = parts.get("cache")
+    if not email or not cache:
+        raise GraphMailError("Invalid API凭据. Expected format: graph:<email>;cache:<cache_path>;saved:<time>")
+    return {"email": email, "cache": cache, "saved": parts.get("saved", "")}
+
+
+def export_graph_credential_package(credential: str, out_dir: Path, config_path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
+    parsed = parse_graph_credential(credential)
+    cache_path = Path(parsed["cache"])
+    if not cache_path.exists():
+        raise GraphMailError(f"Token cache file not found: {cache_path}")
+    if not config_path.exists():
+        raise GraphMailError(f"Graph config not found: {config_path}")
+
+    safe_email = re.sub(r"[^A-Za-z0-9_.-]+", "_", parsed["email"]).strip("_") or "mailbox"
+    package_dir = out_dir / safe_email
+    package_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_target = package_dir / cache_path.name
+    config_target = package_dir / config_path.name
+    script_target = package_dir / Path(__file__).name
+    requirements_target = package_dir / "requirements.txt"
+    shutil.copy2(cache_path, cache_target)
+    shutil.copy2(config_path, config_target)
+    shutil.copy2(Path(__file__), script_target)
+    requirements_target.write_text("msal>=1.30.0\n", encoding="utf-8")
+
+    portable_credential = f"graph:{parsed['email']};cache:{cache_target.name};saved:{parsed.get('saved', '')}"
+    manifest = {
+        "email": parsed["email"],
+        "credential": portable_credential,
+        "cache": cache_target.name,
+        "config": config_target.name,
+        "script": script_target.name,
+        "requirements": requirements_target.name,
+        "saved": parsed.get("saved", ""),
+        "usage": [
+            f"cd {package_dir}",
+            f"python -m pip install -r {requirements_target.name}",
+            f'python {script_target.name} --config {config_target.name} credential-me "{portable_credential}"',
+            f'python {script_target.name} --config {config_target.name} credential-recent "{portable_credential}" --top 3',
+        ],
+    }
+    (package_dir / "credential.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    (package_dir / "README.txt").write_text(
+        "\n".join(
+            [
+                "Microsoft Graph mailbox credential package",
+                "",
+                f"Email: {parsed['email']}",
+                f"Credential: {portable_credential}",
+                "",
+                "Keep the cache file private. Anyone with this package can use the delegated mailbox token until it expires or is revoked.",
+                "Validate from this directory:",
+                f"python -m pip install -r {requirements_target.name}",
+                f'python {script_target.name} --config {config_target.name} credential-me "{portable_credential}"',
+                f'python {script_target.name} --config {config_target.name} credential-recent "{portable_credential}" --top 3',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return {"package_dir": str(package_dir), **manifest}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read Outlook/Hotmail mail with Microsoft Graph.")
     parser.add_argument("--client-id")
@@ -265,6 +373,14 @@ def main() -> None:
     sub.add_parser("me")
     recent = sub.add_parser("recent")
     recent.add_argument("--top", type=int, default=5)
+    credential_me = sub.add_parser("credential-me", help="Validate a sheet K-column API credential.")
+    credential_me.add_argument("credential")
+    credential_recent = sub.add_parser("credential-recent", help="Read recent messages using a sheet K-column API credential.")
+    credential_recent.add_argument("credential")
+    credential_recent.add_argument("--top", type=int, default=5)
+    credential_export = sub.add_parser("credential-export", help="Export a K-column API credential with its cache/config files.")
+    credential_export.add_argument("credential")
+    credential_export.add_argument("--out-dir", type=Path, default=Path("graph_credential_exports"))
     code = sub.add_parser("security-code")
     code.add_argument("target_email")
     code.add_argument("--timeout", type=int, default=180)
@@ -286,6 +402,18 @@ def main() -> None:
         client_id = load_client_id(args.config, args.client_id)
         messages = recent_messages(client_id, args.cache, args.top)
         print(json.dumps(messages, ensure_ascii=False, indent=2))
+    elif args.command == "credential-me":
+        parsed = parse_graph_credential(args.credential)
+        client_id = load_client_id(args.config, args.client_id)
+        me = get_me(client_id, Path(parsed["cache"]))
+        print(json.dumps({"credential": parsed, "me": me}, ensure_ascii=False, indent=2))
+    elif args.command == "credential-recent":
+        parsed = parse_graph_credential(args.credential)
+        client_id = load_client_id(args.config, args.client_id)
+        messages = recent_messages(client_id, Path(parsed["cache"]), args.top)
+        print(json.dumps({"credential": parsed, "messages": messages}, ensure_ascii=False, indent=2))
+    elif args.command == "credential-export":
+        print(json.dumps(export_graph_credential_package(args.credential, args.out_dir, args.config), ensure_ascii=False, indent=2))
     elif args.command == "security-code":
         if args.all_accounts:
             code_value, mailbox = find_security_code_across_accounts(load_accounts_config(args.accounts_config), args.target_email, args.timeout)

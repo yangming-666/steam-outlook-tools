@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 from playwright.async_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
@@ -18,6 +19,29 @@ DEFAULT_FEISHU_SHEET_URL = "https://ru8q9fv50i.feishu.cn/wiki/IM3jw5X9Sialj4k5Ou
 OUTLOOK_MAIL_URL = "https://outlook.live.com/mail/"
 LOGIN_URL = "https://login.live.com/"
 LOGOUT_URL = "https://login.live.com/logout.srf"
+
+WEBAUTHN_CANCEL_SCRIPT = r"""
+(() => {
+  const proto = globalThis.CredentialsContainer && globalThis.CredentialsContainer.prototype;
+  if (!proto || proto.__batchSignupFidoCancelInstalled) return;
+  const originalGet = proto.get;
+  Object.defineProperty(proto, "get", {
+    configurable: true,
+    value: function(options) {
+      if (options && options.publicKey) {
+        return Promise.reject(new DOMException("The operation was cancelled.", "NotAllowedError"));
+      }
+      return originalGet.apply(this, arguments);
+    }
+  });
+  Object.defineProperty(proto, "__batchSignupFidoCancelInstalled", { value: true });
+})();
+"""
+
+
+async def install_webauthn_cancel(context: BrowserContext) -> None:
+    """Make WebAuthn behave exactly like a user cancellation before native Windows UI opens."""
+    await context.add_init_script(script=WEBAUTHN_CANCEL_SCRIPT)
 
 
 @dataclass
@@ -94,6 +118,20 @@ def cell_text(value: Any) -> str:
     return str(value).strip()
 
 
+async def wait_for_timeout_maybe_stop(
+    page: Page,
+    milliseconds: int,
+    pause_controller=None,
+    step: str = "page wait",
+) -> None:
+    deadline = time.monotonic() + max(0, milliseconds) / 1000
+    while time.monotonic() < deadline:
+        if pause_controller and pause_controller.should_stop():
+            raise RuntimeError(f"Stopped during {step}.")
+        remaining_ms = int(max(1, min(500, (deadline - time.monotonic()) * 1000)))
+        await page.wait_for_timeout(remaining_ms)
+
+
 def read_pending_accounts_from_feishu(args) -> list[Account]:
     config = feishu_tool.load_config(Path(args.feishu_config))
     feishu_tool.start_mcp(Path(args.feishu_start_script))
@@ -155,36 +193,36 @@ def read_pending_accounts_from_feishu(args) -> list[Account]:
 
 
 async def click_first(page: Page, patterns: list[str], timeout_ms: int = 1500) -> bool:
-    for pattern in patterns:
-        locator = page.get_by_text(re.compile(pattern, re.I)).first
-        try:
-            await locator.click(timeout=timeout_ms)
-            return True
-        except PlaywrightTimeoutError:
-            pass
-    return False
+    if not patterns:
+        return False
+    combined = re.compile("(?:" + ")|(?:".join(patterns) + ")", re.I)
+    try:
+        await page.get_by_text(combined).first.click(timeout=timeout_ms)
+        return True
+    except PlaywrightTimeoutError:
+        return False
 
 
 async def fill_first(page: Page, selectors: list[str], value: str, timeout_ms: int = 5000) -> bool:
-    for selector in selectors:
-        locator = page.locator(selector).first
-        try:
-            await locator.fill(value, timeout=timeout_ms)
-            return True
-        except PlaywrightTimeoutError:
-            pass
-    return False
+    if not selectors:
+        return False
+    visible_selectors = ", ".join(f"{selector}:visible" for selector in selectors)
+    try:
+        await page.locator(visible_selectors).first.fill(value, timeout=timeout_ms)
+        return True
+    except PlaywrightTimeoutError:
+        return False
 
 
 async def press_enter_first(page: Page, selectors: list[str], timeout_ms: int = 5000) -> bool:
-    for selector in selectors:
-        locator = page.locator(selector).first
-        try:
-            await locator.press("Enter", timeout=timeout_ms)
-            return True
-        except PlaywrightTimeoutError:
-            pass
-    return False
+    if not selectors:
+        return False
+    visible_selectors = ", ".join(f"{selector}:visible" for selector in selectors)
+    try:
+        await page.locator(visible_selectors).first.press("Enter", timeout=timeout_ms)
+        return True
+    except PlaywrightTimeoutError:
+        return False
 
 
 async def click_submit(page: Page) -> None:
@@ -202,18 +240,124 @@ async def click_submit(page: Page) -> None:
         "button:has-text('Continue')",
         "button:has-text('继续')",
     ]
-    for selector in selectors:
+    visible_selectors = ", ".join(f"{selector}:visible" for selector in selectors)
+    try:
+        # Dispatch the DOM click synchronously instead of using Playwright's click
+        # action. Microsoft may open the native passkey chooser while navigation is
+        # settling; fill_login must regain control immediately to follow cancelUrl.
+        await page.locator(visible_selectors).first.evaluate(
+            "element => element.click()",
+            timeout=10000,
+        )
+    except PlaywrightTimeoutError:
+        await page.keyboard.press("Enter")
+
+
+async def prefer_password_sign_in(page: Page, pause_controller=None) -> bool:
+    password_patterns = [
+        r"Use your password",
+        r"Use password",
+        r"Sign in with password",
+        r"Use a password instead",
+        r"使用密码",
+        r"改用密码",
+        r"用密码登录",
+        r"使用你的密码",
+    ]
+    if await click_first(page, password_patterns, timeout_ms=2500):
+        await wait_for_timeout_maybe_stop(page, 2500, pause_controller, "Microsoft password option")
+        return True
+    alternate_method_patterns = [
+        r"Sign in another way",
+        r"Other ways to sign in",
+        r"Use another method",
+        r"Use a different verification option",
+        r"其他登录方法",
+        r"改用其他方式",
+        r"使用其他方式",
+        r"选择其他验证方式",
+        r"换一种验证方式",
+    ]
+    if await click_first(page, alternate_method_patterns, timeout_ms=1500):
+        await wait_for_timeout_maybe_stop(page, 1500, pause_controller, "Microsoft alternate sign-in options")
+        if await click_first(page, password_patterns, timeout_ms=2500):
+            await wait_for_timeout_maybe_stop(page, 2500, pause_controller, "Microsoft password option after alternate sign-in")
+            return True
+    for selector in [
+        "a[href*='pwd']",
+        "button[data-testid*='password' i]",
+        "button[aria-label*='password' i]",
+        "button[aria-label*='密码' i]",
+    ]:
         try:
-            await page.locator(selector).first.click(timeout=2500)
-            return
+            await page.locator(selector).first.click(timeout=1500)
+            await wait_for_timeout_maybe_stop(page, 2500, pause_controller, "Microsoft password selector fallback")
+            return True
         except PlaywrightTimeoutError:
             pass
-    await page.keyboard.press("Enter")
+        except Exception:
+            pass
+    return False
 
 
-async def logout_current_account(page: Page) -> None:
+async def cancel_microsoft_fido_bridge(page: Page, pause_controller=None, timeout_seconds: int = 8) -> bool:
+    """Leave either Microsoft FIDO route before it can block password login."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if pause_controller and pause_controller.should_stop():
+            raise RuntimeError("Stopped while cancelling Microsoft FIDO bridge.")
+        url = getattr(page, "url", "") or ""
+        parsed = urlparse(url)
+        if parsed.netloc.casefold() == "login.microsoft.com" and "/consumers/fido/" in parsed.path.casefold():
+            # The current consumer FIDO page exposes password sign-in under the
+            # bottom-right ellipsis menu. Use that real page route first; merely
+            # going back returns to account entry and selects FIDO again.
+            try:
+                if await prefer_password_sign_in(page, pause_controller):
+                    return True
+            except Exception:
+                pass
+            try:
+                more_options = page.locator(
+                    "button[aria-label*='more' i]:visible, button[title*='more' i]:visible, "
+                    "button[aria-label*='更多']:visible, button[title*='更多']:visible, "
+                    "[role=button][aria-label*='more' i]:visible, [role=button][aria-label*='更多']:visible"
+                )
+                if await more_options.count():
+                    await more_options.first.evaluate("element => element.click()")
+                else:
+                    visible_buttons = page.locator("button:visible")
+                    if await visible_buttons.count() >= 2:
+                        await visible_buttons.last.evaluate("element => element.click()")
+                await wait_for_timeout_maybe_stop(page, 500, pause_controller, "Microsoft FIDO more options")
+                if await prefer_password_sign_in(page, pause_controller):
+                    return True
+            except Exception:
+                pass
+            await page.go_back(wait_until="domcontentloaded")
+            await wait_for_timeout_maybe_stop(page, 500, pause_controller, "Microsoft consumer FIDO cancel")
+            return True
+        if "/bridge/fido" in url.casefold():
+            query = parse_qs(parsed.query)
+            cancel_url = unquote((query.get("cancelUrl") or query.get("cancelurl") or [""])[0]).strip()
+            if not cancel_url.startswith("https://login.live.com/"):
+                await page.go_back(wait_until="domcontentloaded")
+            else:
+                await page.goto(cancel_url, wait_until="domcontentloaded")
+            await wait_for_timeout_maybe_stop(page, 500, pause_controller, "Microsoft FIDO bridge cancel")
+            return True
+        try:
+            if await page.locator("input[type=password]:visible").count():
+                return False
+        except Exception:
+            pass
+        await page.wait_for_timeout(200)
+    return False
+
+
+async def logout_current_account(page: Page, pause_controller=None) -> None:
     await page.goto(LOGOUT_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2500)
+    await wait_for_timeout_maybe_stop(page, 2500, pause_controller, "Microsoft logout")
 
 
 async def maybe_handle_stay_signed_in(page: Page) -> None:
@@ -221,83 +365,200 @@ async def maybe_handle_stay_signed_in(page: Page) -> None:
     await click_first(page, [r"^No$", r"^否$", r"Skip", r"跳过"], timeout_ms=1000)
 
 
-async def fill_login(page: Page, account: Account) -> None:
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+async def fill_login(page: Page, account: Account, pause_controller=None) -> None:
+    # Start authentication from Outlook so Microsoft carries an Outlook return URL.
+    # Opening the generic login.live.com root makes the "Stay signed in" step fall
+    # back to account.microsoft.com instead of the mailbox.
+    await page.goto(OUTLOOK_MAIL_URL, wait_until="domcontentloaded")
 
+    use_another_account_patterns = [
+        r"Use another account",
+        r"Sign in with another account",
+        r"Add account",
+        r"选择其他帐户",
+        r"选择其他账户",
+        r"使用其他帐户",
+        r"使用其他账户",
+        r"添加帐户",
+        r"添加账户",
+    ]
+    email_selectors = [
+        "input[type=email]",
+        "input[name=loginfmt]",
+        "input[autocomplete=username]",
+        "input[inputmode=email]",
+        "input[name=email]",
+        "input[name=login]",
+        "input[aria-label*='email' i]",
+        "input[aria-label*='邮箱' i]",
+    ]
     email_filled = await fill_first(
         page,
-        [
-            "input[type=email]",
-            "input[name=loginfmt]",
-            "input[name=email]",
-            "input[aria-label*='email' i]",
-            "input[aria-label*='邮箱' i]",
-        ],
+        email_selectors,
         account.email,
     )
     if not email_filled:
+        # Outlook.com can redirect an unauthenticated /mail/ request to the
+        # Microsoft 365 marketing page. That page has a 登录 link but no
+        # credential form; enter the Microsoft sign-in endpoint explicitly.
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        await wait_for_timeout_maybe_stop(page, 1000, pause_controller, "Microsoft login fallback navigation")
+        email_filled = await fill_first(page, email_selectors, account.email, timeout_ms=10000)
+    if not email_filled and await click_first(page, use_another_account_patterns, timeout_ms=2500):
+        await wait_for_timeout_maybe_stop(page, 2000, pause_controller, "Microsoft account chooser use another account")
+        email_filled = await fill_first(
+            page,
+            email_selectors,
+            account.email,
+            timeout_ms=10000,
+        )
+    if not email_filled:
         raise RuntimeError("Could not find Microsoft email input.")
     await click_submit(page)
+    fido_cancelled = await cancel_microsoft_fido_bridge(page, pause_controller)
+    if fido_cancelled:
+        # Microsoft's FIDO cancel endpoint can return to the account entry page.
+        # Re-submit the same account once; the cancelled method is then excluded
+        # and the password option becomes available.
+        email_filled_after_cancel = await fill_first(page, email_selectors, account.email, timeout_ms=5000)
+        if email_filled_after_cancel:
+            await click_submit(page)
+            await cancel_microsoft_fido_bridge(page, pause_controller, timeout_seconds=3)
+    if not fido_cancelled:
+        await wait_for_timeout_maybe_stop(page, 1000, pause_controller, "Microsoft email submit")
+    await prefer_password_sign_in(page, pause_controller)
 
     password_filled = await fill_first(
         page,
         [
             "input[type=password]",
             "input[name=passwd]",
+            "input[autocomplete=current-password]",
             "input[aria-label*='password' i]",
             "input[aria-label*='密码' i]",
         ],
         account.password,
         timeout_ms=15000,
     )
+    if not password_filled and await cancel_microsoft_fido_bridge(page, pause_controller):
+        await prefer_password_sign_in(page, pause_controller)
+        password_filled = await fill_first(
+            page,
+            [
+                "input[type=password]",
+                "input[name=passwd]",
+                "input[autocomplete=current-password]",
+                "input[aria-label*='password' i]",
+                "input[aria-label*='密码' i]",
+            ],
+            account.password,
+            timeout_ms=10000,
+        )
+    if not password_filled and await prefer_password_sign_in(page, pause_controller):
+        password_filled = await fill_first(
+            page,
+            [
+                "input[type=password]",
+                "input[name=passwd]",
+                "input[autocomplete=current-password]",
+                "input[aria-label*='password' i]",
+                "input[aria-label*='密码' i]",
+            ],
+            account.password,
+            timeout_ms=10000,
+        )
     if not password_filled:
         raise RuntimeError("Could not find Microsoft password input.")
     await click_submit(page)
-    await page.wait_for_timeout(3000)
+    await wait_for_timeout_maybe_stop(page, 3000, pause_controller, "Microsoft password submit")
 
 
 async def security_challenge_visible(page: Page) -> bool:
+    url = (getattr(page, "url", "") or "").casefold()
+    if "account.microsoft.com/account" in url or "pagename=account" in url:
+        return False
     body = await page.locator("body").inner_text(timeout=5000)
-    markers = [
+    lower = body.casefold()
+    strong_markers = [
         "security code",
         "verify your identity",
         "alternate email",
-        "email address",
+        "verification method",
+        "use a different verification option",
+        "send code to",
+        "already have a code",
+        "we need to verify",
+        "prove your identity",
         "安全代码",
         "验证你的身份",
         "备用电子邮件",
+        "验证方式",
+        "其他验证方式",
+        "将代码发送到",
+        "将验证码发送到",
+        "已经拥有代码",
+        "已有验证码",
+        "证明你的身份",
     ]
-    return any(marker.lower() in body.lower() for marker in markers)
+    if any(marker.casefold() in lower for marker in strong_markers):
+        return True
+    email_address_markers = ["email address", "e-mail address", "邮箱地址", "电子邮件地址"]
+    verification_context_markers = [
+        "security",
+        "verify",
+        "verification",
+        "identity",
+        "code",
+        "安全",
+        "验证",
+        "身份",
+        "代码",
+    ]
+    return any(marker in lower for marker in email_address_markers) and any(
+        marker in lower for marker in verification_context_markers
+    )
 
 
-async def submit_security_email(page: Page, security_email: str) -> bool:
+async def submit_security_email(page: Page, security_email: str, pause_controller=None) -> bool:
     filled = await fill_first(
         page,
         [
             "input[type=email]",
             "input[name=email]",
             "input[name=proof]",
+            "input[name*='proof' i]",
+            "input[name*='email' i]",
+            "input[id*='proof' i]",
+            "input[id*='email' i]",
             "input[aria-label*='email' i]",
             "input[aria-label*='邮箱' i]",
-            "input[type=text]",
+            "input[aria-label*='电子邮件' i]",
+            "input[placeholder*='email' i]",
+            "input[placeholder*='邮箱' i]",
+            "input[placeholder*='电子邮件' i]",
         ],
         security_email,
         timeout_ms=4000,
     )
     if filled:
         await click_submit(page)
-        await page.wait_for_timeout(3000)
+        await wait_for_timeout_maybe_stop(page, 3000, pause_controller, "Microsoft security email submit")
     return filled
 
 
 def extract_code(text: str) -> str | None:
     normalized = re.sub(r"\s+", " ", text)
     patterns = [
-        r"security code[^0-9]{0,80}([0-9]{6,8})",
-        r"code[^0-9]{0,80}([0-9]{6,8})",
+        r"microsoft account security code[^0-9]{0,100}([0-9]{6,8})",
+        r"microsoft security code[^0-9]{0,80}([0-9]{6,8})",
+        r"account security code[^0-9]{0,80}([0-9]{6,8})",
+        r"your microsoft account code[^0-9]{0,80}([0-9]{6,8})",
+        r"your microsoft security code[^0-9]{0,80}([0-9]{6,8})",
         r"安全代码[^0-9]{0,80}([0-9]{6,8})",
-        r"验证码[^0-9]{0,80}([0-9]{6,8})",
-        r"\b([0-9]{6,8})\b",
+        r"Microsoft.{0,80}?安全代码[^0-9]{0,80}([0-9]{6,8})",
+        r"Microsoft.{0,80}?(?:验证码|代码)[^0-9]{0,80}([0-9]{6,8})",
+        r"Microsoft\s*(?:帐户|账户).{0,160}?(?:安全代码|验证码|验证代码)[^0-9]{0,160}([0-9]{6,8})",
+        r"(?:安全代码|验证码|验证代码)[^0-9]{0,80}([0-9]{6,8}).{0,160}?Microsoft",
     ]
     for pattern in patterns:
         match = re.search(pattern, normalized, re.I)
@@ -306,9 +567,136 @@ def extract_code(text: str) -> str | None:
     return None
 
 
-async def search_security_mail(page: Page, query: str) -> None:
+async def read_open_outlook_message_texts(page: Page) -> list[str]:
+    """Read an opened Outlook message, including its isolated message-body frames."""
+    texts: list[str] = []
+    message_selectors = [
+        "[data-testid*='message-body' i]",
+        "[aria-label*='Message body' i]",
+        "[aria-label*='邮件正文']",
+        "[aria-label*='邮件内容']",
+        "[role=document]",
+    ]
+    for selector in message_selectors:
+        try:
+            for value in await page.locator(selector).all_inner_texts():
+                if value.strip():
+                    texts.append(value)
+        except Exception:
+            pass
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            value = await frame.locator("body").inner_text(timeout=2000)
+            if value.strip():
+                texts.append(value)
+        except Exception:
+            pass
+    try:
+        texts.append(await page.locator("body").inner_text(timeout=3000))
+    except Exception:
+        pass
+    return texts
+
+
+async def extract_security_code_from_open_message(page: Page) -> str | None:
+    """Extract a Microsoft code from the actual opened Outlook message content."""
+    texts = await read_open_outlook_message_texts(page)
+    for value in texts:
+        code = extract_code(value)
+        if code:
+            return code
+    return None
+
+
+def parse_mail_row_time(text: str, now_epoch: float | None = None) -> float | None:
+    """Parse the time/date Outlook exposes on a message row."""
+    value = " ".join((text or "").split())
+    if not value:
+        return None
+    now_epoch = now_epoch if now_epoch is not None else time.time()
+    local_now = time.localtime(now_epoch)
+    day_offset = -1 if any(marker in value.casefold() for marker in ["yesterday", "昨天", "前天"]) else 0
+    date_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", value)
+    year, month, day = local_now.tm_year, local_now.tm_mon, local_now.tm_mday
+    if date_match:
+        month, day = int(date_match.group(1)), int(date_match.group(2))
+        if date_match.group(3):
+            year = int(date_match.group(3))
+            if year < 100:
+                year += 2000
+    clock = re.search(r"\b(\d{1,2}):(\d{2})\s*([AaPp][Mm])?\b", value)
+    if not clock:
+        return None
+    hour, minute = int(clock.group(1)), int(clock.group(2))
+    meridiem = (clock.group(3) or "").casefold()
+    if meridiem == "pm" and hour < 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    try:
+        return time.mktime((year, month, day, hour, minute, 0, 0, 0, -1)) + day_offset * 86400
+    except (OverflowError, ValueError):
+        return None
+
+
+async def open_latest_microsoft_security_mail(
+    page: Page,
+    not_before_epoch: float | None = None,
+    row_time_slack_seconds: int = 90,
+) -> bool:
+    """Open the newest real Microsoft security-code message row, preferring unread rows."""
+    row_selector = ", ".join(
+        [
+            "[role=option]",
+            "[data-convid]",
+            "[data-itemid]",
+            "[role=listitem]",
+        ]
+    )
+    rows = page.locator(row_selector).filter(
+        has_text=re.compile(
+            r"(?:Microsoft.*(?:security|code|安全|代码|验证))|(?:(?:security|code|安全|代码|验证).*Microsoft)",
+            re.I,
+        )
+    )
+    candidates: list[tuple[bool, Any]] = []
+    try:
+        count = min(await rows.count(), 20)
+        for index in range(count):
+            row = rows.nth(index)
+            try:
+                text = " ".join(
+                    [
+                        await row.inner_text(timeout=1000),
+                        (await row.get_attribute("aria-label")) or "",
+                        (await row.get_attribute("title")) or "",
+                    ]
+                )
+                if not_before_epoch is not None:
+                    row_epoch = parse_mail_row_time(text)
+                    if row_epoch is None or row_epoch < not_before_epoch - row_time_slack_seconds:
+                        continue
+                unread = bool(re.search(r"\bunread\b|未读", text, re.I))
+                candidates.append((unread, row))
+            except Exception:
+                pass
+        candidates.sort(key=lambda item: not item[0])
+        for _unread, row in candidates:
+            try:
+                await row.click(timeout=3000)
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+async def search_security_mail(page: Page, query: str, pause_controller=None) -> None:
     await page.goto(OUTLOOK_MAIL_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(5000)
+    await wait_for_timeout_maybe_stop(page, 1500, pause_controller, "Outlook security-code mailbox load")
 
     search_selectors = [
         "input[aria-label*='Search' i]",
@@ -322,68 +710,183 @@ async def search_security_mail(page: Page, query: str) -> None:
             search = page.locator(selector).first
             await search.fill(query, timeout=3000)
             await search.press("Enter")
-            await page.wait_for_timeout(5000)
+            await wait_for_timeout_maybe_stop(page, 2000, pause_controller, "Outlook security-code search")
             return
         except PlaywrightTimeoutError:
             pass
 
 
-async def get_security_code(page: Page, target_email: str, timeout_seconds: int) -> str:
+async def get_security_code(
+    page: Page,
+    target_email: str,
+    timeout_seconds: int,
+    pause_controller=None,
+    not_before_epoch: float | None = None,
+) -> str:
     deadline = time.monotonic() + timeout_seconds
     queries = [
-        f'"{target_email}" "security code"',
-        f'"{target_email}" "Microsoft"',
-        "Microsoft account security code",
-        "security code",
-        "安全代码",
+        "isread:no from:accountprotection.microsoft.com",
+        "from:accountprotection.microsoft.com",
     ]
 
     while time.monotonic() < deadline:
-        for query in queries:
-            await search_security_mail(page, query)
-            body_text = await page.locator("body").inner_text(timeout=10000)
-            code = extract_code(body_text)
+        if pause_controller and pause_controller.should_stop():
+            raise RuntimeError(f"Stopped while waiting for security code for {target_email}.")
+        await page.goto(OUTLOOK_MAIL_URL, wait_until="domcontentloaded")
+        await wait_for_timeout_maybe_stop(page, 1500, pause_controller, "Outlook latest security-code mail load")
+        if await open_latest_microsoft_security_mail(page, not_before_epoch=not_before_epoch):
+            await wait_for_timeout_maybe_stop(page, 1200, pause_controller, "Outlook latest security-code message open")
+            code = await extract_security_code_from_open_message(page)
             if code:
                 return code
-
-            # If the list only shows a preview, open the newest visible Microsoft result and try again.
-            opened = await click_first(page, [r"Microsoft", r"security code", r"安全代码"], timeout_ms=1500)
+        for query in queries:
+            if pause_controller and pause_controller.should_stop():
+                raise RuntimeError(f"Stopped while waiting for security code for {target_email}.")
+            if time.monotonic() >= deadline:
+                break
+            await search_security_mail(page, query, pause_controller)
+            opened = await open_latest_microsoft_security_mail(page, not_before_epoch=not_before_epoch)
             if opened:
-                await page.wait_for_timeout(2500)
-                body_text = await page.locator("body").inner_text(timeout=10000)
-                code = extract_code(body_text)
+                await wait_for_timeout_maybe_stop(page, 1200, pause_controller, "Outlook security-code message open")
+                code = await extract_security_code_from_open_message(page)
                 if code:
                     return code
 
-        await page.wait_for_timeout(5000)
+        await wait_for_timeout_maybe_stop(page, 5000, pause_controller, f"Outlook security-code retry for {target_email}")
 
     raise TimeoutError(f"Timed out waiting for security code for {target_email}.")
 
 
-async def submit_code(page: Page, code: str) -> None:
-    filled = await fill_first(
-        page,
-        [
-            "input[name=otc]",
-            "input[name=code]",
-            "input[type=tel]",
-            "input[autocomplete=one-time-code]",
-            "input[type=text]",
-        ],
-        code,
-        timeout_ms=10000,
+async def classify_security_code_input_layout(page: Page, expected_length: int = 6) -> tuple[str, object | None]:
+    """Identify Microsoft's current OTP control shape before writing anything.
+
+    Returns ``("segmented", locator)``, ``("single", locator)``, or
+    ``("none", None)``. Microsoft has deployed both one six-character input
+    and six independent one-character inputs, sometimes without a useful
+    ``name`` attribute.
+    """
+    code_inputs = page.locator(
+        "input[name=otc]:visible, input[name=code]:visible, input[type=tel]:visible, "
+        "input[autocomplete=one-time-code]:visible, input[inputmode=numeric]:visible, "
+        "input[aria-label*='code' i]:visible, input[id*='code' i]:visible, "
+        "input[name*='otp' i]:visible, input[id*='otp' i]:visible"
     )
-    if not filled:
-        raise RuntimeError("Could not find security code input.")
-    await click_submit(page)
-    await page.wait_for_timeout(4000)
+    code_count = await code_inputs.count()
+    if code_count > 1:
+        return "segmented", code_inputs
+    if code_count == 1:
+        return "single", code_inputs
+
+    # Some Microsoft builds expose six bare text inputs, role=textbox nodes, or
+    # contenteditable controls and distinguish them only through maxlength,
+    # inputmode, or position. Inspect only visible controls and reject obvious
+    # email/password controls.
+    generic_inputs = page.locator(
+        "input:visible, textarea:visible, [role='textbox']:visible, [contenteditable='true']:visible"
+    )
+    generic_count = await generic_inputs.count()
+    candidates: list[int] = []
+    for index in range(min(generic_count, 20)):
+        item = generic_inputs.nth(index)
+        attributes = {}
+        for name in ["type", "name", "id", "aria-label", "placeholder", "inputmode", "maxlength", "autocomplete"]:
+            try:
+                attributes[name] = (await item.get_attribute(name, timeout=400) or "").casefold()
+            except Exception:
+                attributes[name] = ""
+        descriptor = " ".join(attributes.values())
+        if any(marker in descriptor for marker in ["email", "mail", "password", "passwd"]):
+            continue
+        if (
+            attributes["inputmode"] == "numeric"
+            or attributes["type"] == "tel"
+            or attributes["maxlength"] in {"1", "2"}
+            or any(marker in descriptor for marker in ["code", "otp", "verification", "验证码", "代码"])
+        ):
+            candidates.append(index)
+    if len(candidates) > 1:
+        return "segmented", (generic_inputs, candidates)
+    if len(candidates) == 1:
+        return "single", generic_inputs.nth(candidates[0])
+    if generic_count >= expected_length and generic_count <= expected_length + 2:
+        return "segmented", (generic_inputs, list(range(generic_count)))
+    return "none", None
 
 
-async def ensure_mailbox_loaded(page: Page) -> None:
+async def fill_security_code_control(control, value: str) -> None:
+    """Fill either a native input or a Microsoft role=textbox control."""
+    try:
+        await control.fill(value, timeout=5000)
+        return
+    except Exception as first_error:
+        try:
+            await control.click(timeout=3000)
+            await control.press("Control+A", timeout=3000)
+            await control.type(value, timeout=5000)
+            return
+        except Exception:
+            raise first_error
+
+
+async def submit_code(page: Page, code: str, pause_controller=None) -> None:
+    normalized_code = str(code or "").strip()
+    if not normalized_code:
+        raise RuntimeError("Microsoft security code is empty.")
+
+    layout, inputs = await classify_security_code_input_layout(page, len(normalized_code))
+    if layout == "segmented":
+        if isinstance(inputs, tuple):
+            segmented_inputs, segmented_indexes = inputs
+            segmented_count = len(segmented_indexes)
+        else:
+            segmented_inputs = inputs
+            segmented_count = await inputs.count()
+            segmented_indexes = list(range(segmented_count))
+        if segmented_count < len(normalized_code):
+            raise RuntimeError(
+                f"Microsoft security code input has {segmented_count} boxes, "
+                f"but the code has {len(normalized_code)} characters."
+            )
+        for index, character in enumerate(normalized_code):
+            await fill_security_code_control(segmented_inputs.nth(segmented_indexes[index]), character)
+        # The six-box Microsoft control may auto-submit as soon as the last
+        # digit is entered and close/navigate the OAuth popup. That is a
+        # successful submission path, not a reason to refresh the mailbox.
+        try:
+            if page.is_closed():
+                return
+            if not await page.locator(
+                "input[name=otc]:visible, input[name=code]:visible, input[type=tel]:visible, "
+                "input[autocomplete=one-time-code]:visible, input[inputmode=numeric]:visible, "
+                "input[aria-label*='code' i]:visible, input[id*='code' i]:visible"
+            ).count():
+                return
+        except Exception as exc:
+            if any(marker in str(exc).casefold() for marker in ["closed", "target page", "browser has been"]):
+                return
+            raise
+    elif layout == "single":
+        await fill_security_code_control(inputs, normalized_code)
+    else:
+        raise RuntimeError(
+            "Could not identify a Microsoft security-code input layout; refusing to fill a generic field."
+        )
+    try:
+        await click_submit(page)
+        if page.is_closed():
+            return
+        await wait_for_timeout_maybe_stop(page, 4000, pause_controller, "Microsoft security code submit")
+    except Exception as exc:
+        if any(marker in str(exc).casefold() for marker in ["closed", "target page", "browser has been"]):
+            return
+        raise
+
+
+async def ensure_mailbox_loaded(page: Page, pause_controller=None) -> None:
     await maybe_handle_stay_signed_in(page)
     if "outlook.live.com" not in page.url:
         await page.goto(OUTLOOK_MAIL_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(5000)
+    await wait_for_timeout_maybe_stop(page, 5000, pause_controller, "Outlook mailbox load")
 
 
 async def connect_security_context(playwright, args) -> tuple[BrowserContext, Page]:
@@ -397,8 +900,11 @@ async def connect_security_context(playwright, args) -> tuple[BrowserContext, Pa
         user_data_dir=args.security_profile,
         headless=False,
         viewport={"width": 1280, "height": 900},
-        args=[f"--window-position={args.security_x},{args.security_y}"],
+        args=[
+            f"--window-position={args.security_x},{args.security_y}",
+        ],
     )
+    await install_webauthn_cancel(context)
     page = context.pages[0] if context.pages else await context.new_page()
     await page.goto(OUTLOOK_MAIL_URL, wait_until="domcontentloaded")
     return context, page
@@ -427,8 +933,11 @@ async def run(args) -> None:
             user_data_dir=args.target_profile,
             headless=False,
             viewport={"width": 1280, "height": 900},
-            args=[f"--window-position={args.target_x},{args.target_y}"],
+            args=[
+                f"--window-position={args.target_x},{args.target_y}",
+            ],
         )
+        await install_webauthn_cancel(target_context)
         target_page = target_context.pages[0] if target_context.pages else await target_context.new_page()
 
         security_context, security_page = await connect_security_context(playwright, args)
@@ -443,7 +952,7 @@ async def run(args) -> None:
                     if not await submit_security_email(target_page, args.security_email):
                         print("Security email field was not found. Waiting for manual input.")
                     code = await get_security_code(security_page, account.email, args.code_timeout)
-                    print(f"Code found for {account.email}: {code}")
+                    print(f"Code found for {account.email}.")
                     await submit_code(target_page, code)
 
                 await ensure_mailbox_loaded(target_page)
@@ -493,5 +1002,13 @@ def parse_args():
     return parser.parse_args()
 
 
+def main() -> int:
+    print("This legacy Outlook-only entry point is disabled.")
+    print("Use run_steam_web_ui.bat for the three supported hardened task flows.")
+    print("Use run_steam_outlook_batch.bat only if you intentionally want the hardened CLI worker.")
+    print("outlook_batch_login.py is kept as an imported helper module; direct execution skips current recovery/status handling.")
+    return 2
+
+
 if __name__ == "__main__":
-    asyncio.run(run(parse_args()))
+    raise SystemExit(main())

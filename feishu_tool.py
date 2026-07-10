@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
@@ -19,6 +19,14 @@ DEFAULT_LARK_MCP_ROOT = DEFAULT_CODEX_HOME / "vendor" / "lark-mcp"
 
 class FeishuError(RuntimeError):
     pass
+
+
+def open_request(request: Request, timeout: int = 30):
+    """Keep loopback MCP traffic out of HTTP(S)_PROXY while preserving proxies for external APIs."""
+    hostname = (urlparse(request.full_url).hostname or "").casefold()
+    if hostname in {"127.0.0.1", "localhost", "::1"}:
+        return build_opener(ProxyHandler({})).open(request, timeout=timeout)
+    return urlopen(request, timeout=timeout)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -33,7 +41,7 @@ def http_json(method: str, url: str, body: dict[str, Any] | None = None, headers
         request_headers.update(headers)
     request = Request(url, data=data, headers=request_headers, method=method)
     try:
-        with urlopen(request, timeout=30) as response:
+        with open_request(request, timeout=30) as response:
             raw = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -61,20 +69,73 @@ def start_mcp(start_script: Path, force: bool = False) -> None:
 
 
 def run_lark_login(config: dict[str, Any], package_root: Path, scopes: str | None = None) -> None:
-    cli = package_root / "node_modules" / "@larksuiteoapi" / "lark-mcp" / "dist" / "cli.js"
-    if not cli.exists():
-        raise FeishuError(f"Missing lark-mcp CLI: {cli}")
+    handler_js = package_root / "node_modules" / "@larksuiteoapi" / "lark-mcp" / "dist" / "auth" / "handler" / "handler-local.js"
+    store_js = package_root / "node_modules" / "@larksuiteoapi" / "lark-mcp" / "dist" / "auth" / "store.js"
+    if not handler_js.exists() or not store_js.exists():
+        raise FeishuError(f"Missing lark-mcp OAuth runtime under: {package_root}")
+    # lark-mcp's stock `login` command stops its callback server after 60s.
+    # Feishu's consent page can take longer on this workstation, leaving the
+    # browser at a dead localhost callback after a successful real click. Run
+    # the same local handler with an explicit 180s lifetime instead.
+    script = r"""
+const express = require('express');
+const { LarkAuthHandlerLocal } = require(process.argv[5]);
+const { authStore } = require(process.argv[6]);
+const appId = process.argv[1];
+const appSecret = process.argv[2];
+const scopeText = process.argv[3] || '';
+const timeout = Number(process.argv[4] || 180000);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+(async () => {
+  console.log('🔐 Starting OAuth login process...');
+  const app = express();
+  app.use(express.json());
+  const authHandler = new LarkAuthHandlerLocal(app, {
+    appId,
+    appSecret,
+    domain: 'https://open.feishu.cn',
+    host: 'localhost',
+    port: 3000,
+    scope: scopeText ? scopeText.split(/[ ,]+/).filter(Boolean) : undefined,
+  });
+  authHandler.setupRoutes();
+  const result = await authHandler.reAuthorize(undefined, true);
+  if (!result.authorizeUrl) throw new Error('OAuth authorization URL was not generated');
+  if (authHandler.timeoutId) clearTimeout(authHandler.timeoutId);
+  authHandler.timeoutId = setTimeout(() => authHandler.stopServer(), timeout);
+  console.log('📱 Please open the following URL in your browser to complete the login:');
+  console.log('🔗 Authorization URL:');
+  console.log(result.authorizeUrl);
+  console.log(`⏳ Waiting for authorization... (timeout in ${Math.round(timeout / 1000)} seconds)`);
+  await authStore.removeLocalAccessToken(appId);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await authStore.getLocalAccessToken(appId)) {
+      console.log('✅ Successfully logged in');
+      try { await authHandler.stopServer(); } catch (_) {}
+      process.exit(0);
+    }
+    await sleep(1000);
+  }
+  console.log('❌ Login failed');
+  try { await authHandler.stopServer(); } catch (_) {}
+  process.exit(1);
+})().catch(error => {
+  console.error('ERROR:', error && (error.stack || error.message) || error);
+  process.exit(1);
+});
+"""
     command = [
         "node",
-        str(cli),
-        "login",
-        "-a",
+        "-e",
+        script,
         str(config["appId"]),
-        "-s",
         str(config["appSecret"]),
+        scopes or "",
+        "180000",
+        str(handler_js).replace("\\", "/"),
+        str(store_js).replace("\\", "/"),
     ]
-    if scopes:
-        command.extend(["--scope", scopes])
     subprocess.run(command, cwd=str(package_root), check=True)
 
 
@@ -133,7 +194,7 @@ def mcp_request(config: dict[str, Any], method: str, params: dict[str, Any] | No
         },
         method="POST",
     )
-    with urlopen(request, timeout=30) as response:
+    with open_request(request, timeout=30) as response:
         text = response.read().decode("utf-8")
     result = parse_sse_json(text)
     if "error" in result:

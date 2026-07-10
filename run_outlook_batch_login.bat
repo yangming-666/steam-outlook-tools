@@ -2,10 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-python -m pip show playwright >nul 2>nul
-if errorlevel 1 (
-  python -m pip install -r requirements.txt || exit /b 1
-)
-
-python -m playwright install chromium || exit /b 1
-python outlook_batch_login.py --pause-after-login %*
+echo This legacy Outlook-only launcher is disabled.
+echo Use run_steam_web_ui.bat for the three supported task flows, or run_steam_outlook_batch.bat for the hardened CLI worker.
+echo The old outlook_batch_login.py path does not include the current Steam/Dota/forwarding recovery and status handling.
+exit /b 2

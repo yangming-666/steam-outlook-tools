@@ -8,6 +8,7 @@ errors/
 graph_config.json
 graph_accounts.json
 code_forward_config.json
+steam_web_ui_settings.json
 
 accounts.csv
 account.csv
