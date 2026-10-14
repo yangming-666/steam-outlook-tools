@@ -4,6 +4,7 @@ import inspect
 import argparse
 import json
 import asyncio
+import time
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from types import SimpleNamespace
@@ -1076,6 +1077,39 @@ class SteamProcessFlowTests(unittest.TestCase):
         self.assertLess(source.index("microsoft_security_code_entry_visible(page)"), source.index("submit_security_email(page"))
         self.assertIn("did not reach the code-entry page", source)
 
+    def test_external_forward_targets_skip_feishu_row_writeback(self):
+        account_source = inspect.getsource(steam_outlook_batch.SteamAccount)
+        rule_source = inspect.getsource(steam_outlook_batch.run_forward_rule_setup)
+        worker_source = inspect.getsource(steam_outlook_batch.run_with_callbacks)
+        self.assertIn("external_target", account_source)
+        self.assertIn("External target forwarding verified", rule_source)
+        self.assertIn("external_only", worker_source)
+
+    def test_forward_verification_detects_account_without_your_variant(self):
+        source = inspect.getsource(steam_outlook_batch.outlook_forward_verification_required)
+        self.assertIn("登录并验证帐户", source)
+        self.assertIn("sign in and verify account", source)
+
+    def test_external_targets_require_capacity_checked_pool(self):
+        source = inspect.getsource(steam_outlook_batch.run_with_callbacks)
+        self.assertIn("security_pool_full_emails", source)
+        self.assertIn("禁止绕过满额过滤", source)
+
+    def test_forward_verification_refreshes_parent_rule_editor_after_popup_closes(self):
+        source = inspect.getsource(steam_outlook_batch.wait_for_outlook_forward_verification_commit)
+        self.assertIn("rule_page.reload", source)
+        self.assertIn("verification popup closed", source)
+
+    def test_browser_password_prompt_is_closed_and_rule_failure_retries(self):
+        prompt_source = inspect.getsource(steam_outlook_batch.dismiss_password_save_prompt)
+        prompt_handler_source = inspect.getsource(steam_outlook_batch.handle_microsoft_post_login_prompts)
+        rule_source = inspect.getsource(steam_outlook_batch.run_forward_rule_setup)
+        retry_source = inspect.getsource(steam_outlook_batch.is_outlook_context_retryable_error)
+        self.assertIn("保存密码", prompt_source)
+        self.assertIn("dismiss_password_save_prompt", prompt_handler_source)
+        self.assertIn("retrying this account once", rule_source)
+        self.assertIn("规则编辑器未", retry_source)
+
     def test_forward_verification_waits_for_rule_editor_commit_after_popup_redirect(self):
         class FakePopup:
             url = "https://outlook.live.com/mail/"
@@ -1123,6 +1157,9 @@ class SteamProcessFlowTests(unittest.TestCase):
         self.assertIn("RapidOCR", source)
         self.assertIn("pyautogui.click", source)
         self.assertIn("feishu_authorize_before.png", source)
+        self.assertIn("click_feishu_authorize_control", source)
+        self.assertIn("Feishu authorize action confirmed", inspect.getsource(steam_web_ui.click_feishu_authorize_control))
+        self.assertIn("consent page", inspect.getsource(steam_web_ui.click_feishu_authorize_control))
         login_source = inspect.getsource(steam_outlook_batch.feishu_tool.run_lark_login)
         self.assertIn("180000", login_source)
         self.assertIn("LarkAuthHandlerLocal", login_source)
@@ -2023,9 +2060,30 @@ class SteamProcessFlowTests(unittest.TestCase):
         source = inspect.getsource(outlook_batch_login.submit_security_email)
 
         self.assertNotIn('"input[type=text]"', source)
+        self.assertIn("outlook.live.com/mail", source)
         self.assertIn("input[name*='proof' i]", source)
         self.assertIn("input[name*='email' i]", source)
         self.assertIn("input[placeholder*='email' i]", source)
+
+    def test_security_challenge_detection_rejects_outlook_search_shell(self):
+        source = inspect.getsource(outlook_batch_login.security_challenge_visible)
+        self.assertIn("outlook.live.com/mail", source)
+        request_source = inspect.getsource(steam_outlook_batch.request_microsoft_security_email_code)
+        self.assertIn("target page is an Outlook mailbox/search page", request_source)
+
+        class MailShell:
+            url = "https://outlook.live.com/mail/"
+
+            def __init__(self):
+                self.locator_called = False
+
+            def locator(self, *_args, **_kwargs):
+                self.locator_called = True
+                raise AssertionError("Outlook search shell must not be inspected as a security challenge")
+
+        page = MailShell()
+        self.assertFalse(asyncio.run(outlook_batch_login.security_challenge_visible(page)))
+        self.assertFalse(page.locator_called)
 
     def test_microsoft_six_box_code_input_fills_each_digit(self):
         class FakeInput:
@@ -2068,6 +2126,51 @@ class SteamProcessFlowTests(unittest.TestCase):
         ):
             asyncio.run(outlook_batch_login.submit_code(page, "123456"))
         self.assertEqual(["1", "2", "3", "4", "5", "6"], page.inputs.values)
+
+    def test_microsoft_three_box_code_input_fills_two_characters_per_box(self):
+        class FakeInput:
+            def __init__(self, values, index=None):
+                self.values = values
+                self.index = index
+
+            async def get_attribute(self, _name, timeout=0):
+                return ""
+
+            async def fill(self, value, timeout=0):
+                self.values[self.index] = value
+
+        class FakeInputs:
+            def __init__(self):
+                self.values = [""] * 3
+
+            async def count(self):
+                return 3
+
+            def nth(self, index):
+                return FakeInput(self.values, index)
+
+        class FakePage:
+            def __init__(self):
+                self.inputs = FakeInputs()
+
+            def locator(self, _selector):
+                return self.inputs
+
+            def is_closed(self):
+                return False
+
+        page = FakePage()
+        async def no_click(*_args, **_kwargs):
+            return None
+
+        async def no_wait(*_args, **_kwargs):
+            return None
+
+        with patch.object(outlook_batch_login, "click_submit", new=no_click), patch.object(
+            outlook_batch_login, "wait_for_timeout_maybe_stop", new=no_wait
+        ):
+            asyncio.run(outlook_batch_login.submit_code(page, "123456"))
+        self.assertEqual(["12", "34", "56"], page.inputs.values)
 
     def test_manual_wait_includes_page_state_and_optional_screenshot(self):
         source = inspect.getsource(steam_outlook_batch.wait_for_manual_continue)
@@ -2271,7 +2374,7 @@ class SteamProcessFlowTests(unittest.TestCase):
         source = inspect.getsource(steam_outlook_batch.run_with_callbacks)
         challenge_index = source.index("challenge_security_email = account.backup_security_email or args.security_email")
         ensure_index = source.index("ensure_security_mailbox_for_account(", challenge_index)
-        submit_index = source.index("submit_security_email_or_record_failure(", challenge_index)
+        submit_index = source.index("request_microsoft_security_email_code(", challenge_index)
 
         self.assertLess(ensure_index, submit_index)
         self.assertIn("Security mailbox pool is enabled", source)
@@ -2330,6 +2433,7 @@ class SteamProcessFlowTests(unittest.TestCase):
     def test_microsoft_security_code_search_queries_are_not_bare_terms(self):
         source = inspect.getsource(outlook_batch_login.get_security_code)
         open_source = inspect.getsource(outlook_batch_login.open_latest_microsoft_security_mail)
+        gate_source = inspect.getsource(outlook_batch_login.should_accept_microsoft_security_mail_row)
         query_block = source[source.index("queries = [") : source.index("while time.monotonic() < deadline")]
 
         self.assertIn("accountprotection.microsoft.com", query_block)
@@ -2338,7 +2442,7 @@ class SteamProcessFlowTests(unittest.TestCase):
         self.assertNotIn('"security code",', query_block)
         self.assertNotIn('"安全代码",', query_block)
         self.assertIn("not_before_epoch", source)
-        self.assertIn("row_epoch < not_before_epoch", open_source)
+        self.assertIn("row_epoch < not_before_epoch", gate_source)
 
     def test_microsoft_security_code_extractor_requires_fixed_context(self):
         self.assertIsNone(outlook_batch_login.extract_code("Order number 123456"))
@@ -2352,10 +2456,84 @@ class SteamProcessFlowTests(unittest.TestCase):
             outlook_batch_login.extract_code("Microsoft 帐户安全团队：你的验证代码是 778899。"),
         )
 
+    def test_microsoft_security_mail_time_filter_respects_relative_days(self):
+        now = time.mktime((2026, 7, 10, 10, 15, 0, 0, 0, -1))
+        yesterday = outlook_batch_login.parse_mail_row_time("昨天 23:59", now)
+        day_before = outlook_batch_login.parse_mail_row_time("前天 23:59", now)
+        numeric_date = outlook_batch_login.parse_mail_row_time("2026/07/09 23:59", now)
+
+        self.assertIsNotNone(yesterday)
+        self.assertIsNotNone(day_before)
+        self.assertIsNotNone(numeric_date)
+        self.assertLess(yesterday, now)
+        self.assertLess(day_before, yesterday)
+        self.assertEqual(yesterday, numeric_date)
+
+    def test_microsoft_security_mail_row_uses_real_sender_subject_mask_and_code_shape(self):
+        real_row_shape = (
+            "未读 Microsoft 帐户团队 个人 Microsoft 帐户安全代码 17:06 "
+            "Microsoft 帐户 安全代码 请对个人 Microsoft 帐户 ma**z@hotmail.com "
+            "使用以下安全代码。 安全代码: 123456 仅在官方网站或应用上输入此代码。"
+        )
+
+        self.assertEqual("ma**z@hotmail.com", outlook_batch_login.microsoft_masked_email("matt_burrows_in_nz@hotmail.com"))
+        self.assertTrue(
+            outlook_batch_login.is_microsoft_security_mail_row(
+                real_row_shape,
+                "matt_burrows_in_nz@hotmail.com",
+            )
+        )
+        self.assertFalse(
+            outlook_batch_login.is_microsoft_security_mail_row(
+                real_row_shape.replace("ma**z@hotmail.com", "ma**t@hotmail.com"),
+                "matt_burrows_in_nz@hotmail.com",
+            )
+        )
+
+    def test_microsoft_security_mail_replay_gate_separates_same_minute_ids(self):
+        row = (
+            "Microsoft 帐户团队 个人 Microsoft 帐户安全代码 17:18 "
+            "Microsoft 帐户 安全代码: 123456 请对个人 Microsoft 帐户 ma**z@hotmail.com 使用"
+        )
+        request = time.mktime((2026, 7, 10, 17, 18, 28, 0, 0, -1))
+        row_epoch = time.mktime((2026, 7, 10, 17, 18, 0, 0, 0, -1))
+
+        self.assertFalse(
+            outlook_batch_login.should_accept_microsoft_security_mail_row(
+                row, row_epoch, {"old-id"}, request, {"old-id"},
+                "matt_burrows_in_nz@hotmail.com",
+            )
+        )
+        self.assertTrue(
+            outlook_batch_login.should_accept_microsoft_security_mail_row(
+                row, row_epoch, {"new-id"}, request, {"old-id"},
+                "matt_burrows_in_nz@hotmail.com",
+            )
+        )
+        self.assertFalse(
+            outlook_batch_login.should_accept_microsoft_security_mail_row(
+                row, row_epoch, set(), request, set(),
+                "matt_burrows_in_nz@hotmail.com",
+            )
+        )
+
+    def test_microsoft_security_mail_waits_for_delivery_and_captures_old_ids(self):
+        source = inspect.getsource(outlook_batch_login.get_security_code)
+        collect_source = inspect.getsource(outlook_batch_login.collect_microsoft_security_mail_ids)
+        open_source = inspect.getsource(outlook_batch_login.open_latest_microsoft_security_mail)
+        gate_source = inspect.getsource(outlook_batch_login.should_accept_microsoft_security_mail_row)
+
+        self.assertIn("delivery_grace_seconds = 8", source)
+        self.assertIn("microsoft_security_mail_ids_from_row", collect_source)
+        self.assertIn("OUTLOOK_MAIL_URL", collect_source)
+        self.assertIn("request_minute", gate_source)
+        self.assertIn("row_time_slack_seconds: int = 0", open_source)
+
     def test_browser_security_code_submission_retries_rejected_codes(self):
         run_source = inspect.getsource(steam_outlook_batch.run_with_callbacks)
         submit_source = inspect.getsource(steam_outlook_batch.submit_microsoft_security_code_with_validation)
         detect_source = inspect.getsource(steam_outlook_batch.detect_microsoft_code_rejected)
+        reauth_source = inspect.getsource(steam_outlook_batch.complete_outlook_forward_reauthentication)
 
         self.assertIn("for microsoft_code_attempt in range(1, 3):", run_source)
         self.assertIn("Microsoft security code was rejected twice", run_source)
@@ -2368,6 +2546,14 @@ class SteamProcessFlowTests(unittest.TestCase):
         self.assertIn("Microsoft security code retry", run_source)
         self.assertIn("code has expired", steam_outlook_batch.MICROSOFT_CODE_REJECTED_MARKERS)
         self.assertIn("验证码错误", steam_outlook_batch.MICROSOFT_CODE_REJECTED_MARKERS)
+        self.assertIn("restarting the email-delivery method once", reauth_source)
+        self.assertIn("is_non_skippable_verification_error", run_source)
+        self.assertIn("re-select the assigned email method", run_source)
+
+    def test_microsoft_login_reidentifies_email_page_after_fido_return(self):
+        source = inspect.getsource(outlook_batch_login.fill_login)
+        self.assertIn("email_filled_retry", source)
+        self.assertIn("Microsoft email re-submit after FIDO return", source)
 
     def test_microsoft_security_code_submission_waits_for_delayed_rejection(self):
         class FakeLocator:
@@ -2626,6 +2812,45 @@ class SteamProcessFlowTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "write verification failed"):
                 steam_outlook_batch.write_sheet_verified({}, "token", "sheet", "I72:I72", [["expected"]])
+
+    def test_feishu_user_api_refreshes_once_after_expired_token(self):
+        feishu = steam_outlook_batch.feishu_tool
+        with patch.object(feishu, "get_stored_user_access_token", return_value="old-token"), patch.object(
+            feishu, "refresh_stored_user_access_token", return_value="new-token"
+        ) as refresh, patch.object(
+            feishu,
+            "http_json",
+            side_effect=[feishu.FeishuError("HTTP PUT failed: 401 Unauthorized: token expired"), {"code": 0}],
+        ) as request:
+            result = feishu.feishu_api({}, "PUT", "/open-apis/sheets/v2/spreadsheets/s/values", {}, use_uat=True)
+
+        self.assertEqual(result, {"code": 0})
+        refresh.assert_called_once()
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("new-token", request.call_args.args[-1]["Authorization"])
+
+    def test_expired_feishu_write_is_non_skippable(self):
+        self.assertTrue(
+            steam_outlook_batch.is_non_skippable_verification_error(
+                RuntimeError("HTTP PUT failed: 401 Unauthorized: code 99991677 token expired")
+            )
+        )
+
+    def test_forward_rule_batch_stops_on_any_row_error(self):
+        source = inspect.getsource(steam_outlook_batch.run_with_callbacks)
+        self.assertIn('getattr(args, "task_mode", "") == "forward_rule"', source)
+
+    def test_blocked_security_email_in_column_j_is_reassigned_from_pool(self):
+        source = inspect.getsource(steam_outlook_batch.read_pending_accounts)
+        self.assertIn("Treat it as unbound", source)
+        self.assertIn("backup_security_email.casefold() in blocked_security_mailboxes", source)
+
+    def test_stale_forward_placeholders_cannot_overwrite_real_settings(self):
+        source = inspect.getsource(steam_web_ui.save_ui_settings)
+        build_source = inspect.getsource(steam_web_ui.build_args)
+        self.assertIn("FORWARD_ADDRESS_PLACEHOLDERS", source)
+        self.assertIn("stale browser", source)
+        self.assertIn("stored_settings", build_source)
 
     def test_outlook_identity_mismatch_fails_closed(self):
         async def run_case():

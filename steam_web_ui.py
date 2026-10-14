@@ -19,6 +19,7 @@ import steam_outlook_batch
 APP_VERSION = "2026-07-10-persistent-staged-flow"
 DEFAULT_STEAM_EXE = "D:\\Steam\\steam.exe"
 DEFAULT_FORWARD_FROM_EMAIL = "noreply@steampowered.com"
+FORWARD_ADDRESS_PLACEHOLDERS = {"sender@example.com", "a@example.com"}
 WEB_UI_SETTINGS = Path("steam_web_ui_settings.json")
 WEB_UI_RUN_LOG = Path("steam_web_ui.run.log")
 WEB_UI_RUN_LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -56,6 +57,15 @@ def save_ui_settings(data: dict) -> None:
     for key in ["security_email", "bind_security_email", "forward_from_email", "forward_to_email", "security_mailbox_pool"]:
         if key in data:
             value = (data.get(key) or "").strip()
+            if (
+                key in {"forward_from_email", "forward_to_email"}
+                and value.casefold() in FORWARD_ADDRESS_PLACEHOLDERS
+                and (existing.get(key) or "").strip().casefold() not in FORWARD_ADDRESS_PLACEHOLDERS
+            ):
+                # A stale browser can keep sending the original HTML test
+                # placeholders during periodic preflight calls. Never let
+                # those values overwrite an already configured real target.
+                continue
             existing[key] = value
     existing = normalize_ui_settings(existing)
     WEB_UI_SETTINGS.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -158,14 +168,12 @@ def check_feishu_auth_status(*, force: bool = False) -> dict:
         return dict(FEISHU_AUTH_CACHE)
     try:
         config = steam_outlook_batch.feishu_tool.load_config(steam_outlook_batch.feishu_tool.DEFAULT_CONFIG)
-        token = steam_outlook_batch.feishu_tool.get_stored_user_access_token(
+        result = steam_outlook_batch.feishu_tool.feishu_api(
             config,
-            steam_outlook_batch.feishu_tool.DEFAULT_LARK_MCP_ROOT,
-        )
-        result = steam_outlook_batch.feishu_tool.http_json(
             "GET",
-            "https://open.feishu.cn/open-apis/authen/v1/user_info",
-            headers={"Authorization": f"Bearer {token}"},
+            "/open-apis/authen/v1/user_info",
+            use_uat=True,
+            package_root=steam_outlook_batch.feishu_tool.DEFAULT_LARK_MCP_ROOT,
         )
         if result.get("code") not in {None, 0}:
             raise RuntimeError(result.get("msg") or f"飞书返回错误码 {result.get('code')}")
@@ -1067,6 +1075,12 @@ def parse_optional_int(value, label: str, *, default=None):
 
 
 def build_args(data: dict) -> argparse.Namespace:
+    stored_settings = load_ui_settings()
+    for key in ["forward_from_email", "forward_to_email"]:
+        incoming = (data.get(key) or "").strip()
+        stored = (stored_settings.get(key) or "").strip()
+        if incoming.casefold() in FORWARD_ADDRESS_PLACEHOLDERS and stored.casefold() not in FORWARD_ADDRESS_PLACEHOLDERS:
+            data[key] = stored
     task_mode = data.get("task_mode") or "full"
     security_mailbox_pool = data.get("security_mailbox_pool") or ""
     pool = steam_outlook_batch.parse_security_mailbox_pool(security_mailbox_pool)
@@ -1287,6 +1301,105 @@ def select_feishu_authorize_ocr_item(items: list[dict]) -> dict | None:
     return None
 
 
+def feishu_consent_controls(window):
+    """Return the exact consent controls only while a Feishu consent page is visible."""
+    controls = window.descendants()
+    labels = [normalize_ocr_label(control.window_text() or "") for control in controls]
+    combined = "|".join(labels)
+    has_context = any(
+        marker in combined
+        for marker in [
+            "请求以下飞书账号进行授权",
+            "可授予的权限",
+            "获取用户身份标识",
+            "requestingauthorization",
+            "permissionsrequested",
+        ]
+    )
+    reject_controls = [
+        control
+        for control in controls
+        if normalize_ocr_label(control.window_text() or "") in {"拒绝", "reject", "deny"}
+    ]
+    authorize_controls = [
+        control
+        for control in controls
+        if normalize_ocr_label(control.window_text() or "") in {"授权", "authorize", "allow"}
+    ]
+    if has_context and len(reject_controls) == 1 and len(authorize_controls) == 1:
+        return authorize_controls[0]
+    return None
+
+
+def click_feishu_authorize_control(window, control, log=print) -> bool:
+    """Click a consent control and require the consent surface to disappear."""
+    import pyautogui
+
+    methods = []
+    try:
+        control.invoke()
+        methods.append("UIA invoke")
+    except Exception:
+        pass
+    time.sleep(0.8)
+    try:
+        if feishu_consent_controls(window) is None:
+            log(f"Feishu authorize action confirmed after {'/'.join(methods)}.")
+            return True
+    except Exception:
+        try:
+            if not window.exists():
+                log(f"Feishu authorize action confirmed after {'/'.join(methods)}; consent window closed.")
+                return True
+        except Exception:
+            pass
+
+    try:
+        control.click_input()
+        methods.append("UIA click_input")
+    except Exception:
+        pass
+    time.sleep(0.8)
+    try:
+        if feishu_consent_controls(window) is None:
+            log(f"Feishu authorize action confirmed after {'/'.join(methods)}.")
+            return True
+    except Exception:
+        try:
+            if not window.exists():
+                log(f"Feishu authorize action confirmed after {'/'.join(methods)}; consent window closed.")
+                return True
+        except Exception:
+            pass
+
+    # Chrome's UIA tree can expose the button while ignoring the control
+    # pattern. Use the control's own screen rectangle for a real mouse event,
+    # avoiding window/DPI coordinate conversions.
+    try:
+        rect = control.rectangle()
+        pyautogui.moveTo((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2, duration=0.05)
+        pyautogui.click()
+        methods.append("screen click")
+    except Exception:
+        pass
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        time.sleep(0.4)
+        try:
+            if feishu_consent_controls(window) is None:
+                log(f"Feishu authorize action confirmed after {'/'.join(methods)}.")
+                return True
+        except Exception:
+            try:
+                if not window.exists():
+                    log(f"Feishu authorize action confirmed after {'/'.join(methods)}; consent window closed.")
+                    return True
+            except Exception:
+                pass
+    log(f"Feishu authorize click did not change the consent page after {'/'.join(methods)}.")
+    return False
+
+
 def auto_click_feishu_authorize(
     log=print,
     stop_event: threading.Event | None = None,
@@ -1309,78 +1422,99 @@ def auto_click_feishu_authorize(
     deadline = time.monotonic() + timeout_seconds
     next_log = 0.0
     while time.monotonic() < deadline and not stop_event.is_set():
-        target_window = None
+        browser_windows = []
         try:
             for window in Desktop(backend="uia").windows():
                 title = (window.window_text() or "").casefold()
-                if ("飞书授权" in title or "feishu authorization" in title or "lark authorization" in title) and (
-                    "chrome" in title or "edge" in title
-                ):
+                if "chrome" in title or "edge" in title or "chromium" in title:
                     rect = window.rectangle()
                     if rect.width() >= 700 and rect.height() >= 500:
-                        target_window = window
-                        break
+                        browser_windows.append(window)
         except Exception:
-            target_window = None
+            browser_windows = []
 
-        if target_window is None:
+        if not browser_windows:
             if time.monotonic() >= next_log:
                 log("Feishu authorize auto-click waiting for consent browser window.")
                 next_log = time.monotonic() + 5
             time.sleep(0.5)
             continue
 
-        try:
-            target_window.set_focus()
-            time.sleep(0.4)
-            rect = target_window.rectangle()
-            image = pyautogui.screenshot(region=(rect.left, rect.top, rect.width(), rect.height()))
-            array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            result, _ = engine(array)
-            items = []
-            for box, text, score in result or []:
-                xs = [point[0] for point in box]
-                ys = [point[1] for point in box]
-                items.append(
-                    {
-                        "text": str(text),
-                        "score": float(score),
-                        "cx": sum(xs) / len(xs),
-                        "cy": sum(ys) / len(ys),
-                    }
-                )
-            target = select_feishu_authorize_ocr_item(items)
-            if target is None:
-                if time.monotonic() >= next_log:
-                    summary = " | ".join(
-                        f"{item['text']}({item['score']:.2f})"
-                        for item in sorted(items, key=lambda item: item["score"], reverse=True)[:12]
-                    )
-                    log(f"Feishu authorize OCR waiting; visible={summary or 'no text'}")
-                    next_log = time.monotonic() + 5
-                time.sleep(0.6)
-                continue
-
-            before_path = Path("errors") / "feishu_authorize_before.png"
-            before_path.parent.mkdir(parents=True, exist_ok=True)
-            image.save(before_path)
-            click_x = int(rect.left + target["cx"])
-            click_y = int(rect.top + target["cy"])
-            pyautogui.click(click_x, click_y)
-            log(f"Feishu authorize button clicked through screenshot OCR + real input at ({click_x}, {click_y}).")
-            time.sleep(1.2)
+        found_text = []
+        for target_window in browser_windows:
             try:
-                pyautogui.screenshot(region=(rect.left, rect.top, rect.width(), rect.height())).save(
-                    Path("errors") / "feishu_authorize_after.png"
-                )
-            except Exception:
-                pass
-            return True
-        except Exception as exc:
-            if time.monotonic() >= next_log:
-                log(f"Feishu authorize auto-click retrying after window/OCR error: {exc}")
-                next_log = time.monotonic() + 5
-            time.sleep(0.6)
+                target_window.set_focus()
+                time.sleep(0.25)
+                rect = target_window.rectangle()
+                # Chrome exposes the Feishu consent controls through UIA even
+                # when the page title/bitmap is affected by DPI scaling. Use
+                # the exact context and a unique button label before falling
+                # back to OCR coordinates.
+                try:
+                    authorize_control = feishu_consent_controls(target_window)
+                    if authorize_control is not None:
+                        if click_feishu_authorize_control(target_window, authorize_control, log=log):
+                            time.sleep(0.8)
+                            return True
+                        # Do not run OCR against the same unchanged page in
+                        # this iteration; retry the full control discovery.
+                        continue
+                        return True
+                except Exception:
+                    pass
+                try:
+                    # Capture from the window handle so Windows DPI scaling
+                    # cannot shift the OCR coordinates away from the button.
+                    image = target_window.capture_as_image()
+                except Exception:
+                    image = pyautogui.screenshot(region=(rect.left, rect.top, rect.width(), rect.height()))
+                array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                result, _ = engine(array)
+                items = []
+                for box, text, score in result or []:
+                    xs = [point[0] for point in box]
+                    ys = [point[1] for point in box]
+                    items.append(
+                        {
+                            "text": str(text),
+                            "score": float(score),
+                            "cx": sum(xs) / len(xs),
+                            "cy": sum(ys) / len(ys),
+                        }
+                    )
+                found_text.extend(items)
+                target = select_feishu_authorize_ocr_item(items)
+                if target is None:
+                    continue
+
+                before_path = Path("errors") / "feishu_authorize_before.png"
+                before_path.parent.mkdir(parents=True, exist_ok=True)
+                image.save(before_path)
+                try:
+                    target_window.click_input(coords=(int(target["cx"]), int(target["cy"])))
+                except Exception:
+                    pyautogui.click(int(rect.left + target["cx"]), int(rect.top + target["cy"]))
+                # OCR gives us a candidate, but it is not success until the
+                # consent surface actually disappears.
+                if click_feishu_authorize_control(target_window, target, log=log):
+                    try:
+                        target_window.capture_as_image().save(Path("errors") / "feishu_authorize_after.png")
+                    except Exception:
+                        pass
+                    return True
+            except Exception as exc:
+                if time.monotonic() >= next_log:
+                    log(f"Feishu authorize auto-click retrying after window/OCR error: {exc}")
+                    next_log = time.monotonic() + 5
+
+        if time.monotonic() >= next_log:
+            summary = " | ".join(
+                f"{item['text']}({item['score']:.2f})"
+                for item in sorted(found_text, key=lambda item: item["score"], reverse=True)[:12]
+            )
+            log(f"Feishu authorize OCR waiting; visible={summary or 'no text'}")
+            next_log = time.monotonic() + 5
+        time.sleep(0.6)
 
     if not stop_event.is_set():
         log("Feishu authorize auto-click timed out without a verified consent button.")

@@ -206,12 +206,28 @@ async def click_first(page: Page, patterns: list[str], timeout_ms: int = 1500) -
 async def fill_first(page: Page, selectors: list[str], value: str, timeout_ms: int = 5000) -> bool:
     if not selectors:
         return False
+    # Microsoft changes the verification form between builds.  A broad
+    # selector such as input[name*="email"] can resolve to a proof-method
+    # radio button before the real text box appears.  The callers exclude
+    # non-editable controls, so combine the selectors into one bounded lookup:
+    # do not wait once per selector and make the radio branch appear stuck.
     visible_selectors = ", ".join(f"{selector}:visible" for selector in selectors)
     try:
         await page.locator(visible_selectors).first.fill(value, timeout=timeout_ms)
         return True
     except PlaywrightTimeoutError:
         return False
+    except Exception as exc:
+        message = str(exc).casefold()
+        if any(marker in message for marker in [
+            "cannot be filled",
+            "not editable",
+            "element is not an input",
+            "input of type \"radio\"",
+            "input of type \"checkbox\"",
+        ]):
+            return False
+        raise
 
 
 async def press_enter_first(page: Page, selectors: list[str], timeout_ms: int = 5000) -> bool:
@@ -237,6 +253,12 @@ async def click_submit(page: Page) -> None:
         "button:has-text('是')",
         "button:has-text('Verify')",
         "button:has-text('验证')",
+        "button:has-text('Send code')",
+        "button:has-text('发送代码')",
+        "button:has-text('发送验证码')",
+        "button:has-text('获取验证码')",
+        "input[type=submit][value*='Send code' i]",
+        "input[type=submit][value*='发送验证码']",
         "button:has-text('Continue')",
         "button:has-text('继续')",
     ]
@@ -468,6 +490,28 @@ async def fill_login(page: Page, account: Account, pause_controller=None) -> Non
             timeout_ms=10000,
         )
     if not password_filled:
+        # FIDO cancellation and stale Microsoft account pages can return to
+        # the localized account-entry screen. Re-detect the page state instead
+        # of assuming that the next screen must already contain a password box.
+        email_filled_retry = await fill_first(page, email_selectors, account.email, timeout_ms=5000)
+        if email_filled_retry:
+            await click_submit(page)
+            await cancel_microsoft_fido_bridge(page, pause_controller, timeout_seconds=5)
+            await wait_for_timeout_maybe_stop(page, 1000, pause_controller, "Microsoft email re-submit after FIDO return")
+            await prefer_password_sign_in(page, pause_controller)
+            password_filled = await fill_first(
+                page,
+                [
+                    "input[type=password]",
+                    "input[name=passwd]",
+                    "input[autocomplete=current-password]",
+                    "input[aria-label*='password' i]",
+                    "input[aria-label*='密码' i]",
+                ],
+                account.password,
+                timeout_ms=10000,
+            )
+    if not password_filled:
         raise RuntimeError("Could not find Microsoft password input.")
     await click_submit(page)
     await wait_for_timeout_maybe_stop(page, 3000, pause_controller, "Microsoft password submit")
@@ -475,6 +519,11 @@ async def fill_login(page: Page, account: Account, pause_controller=None) -> Non
 
 async def security_challenge_visible(page: Page) -> bool:
     url = (getattr(page, "url", "") or "").casefold()
+    # The Outlook mailbox/search shell can contain generic words such as
+    # "security" and "code" in its navigation and message list. It is never
+    # the Microsoft sign-in challenge surface, and must not be treated as one.
+    if "outlook.live.com/mail" in url:
+        return False
     if "account.microsoft.com/account" in url or "pagename=account" in url:
         return False
     body = await page.locator("body").inner_text(timeout=5000)
@@ -520,30 +569,106 @@ async def security_challenge_visible(page: Page) -> bool:
 
 
 async def submit_security_email(page: Page, security_email: str, pause_controller=None) -> bool:
+    # Never let the broad email selectors below target Outlook's search box or
+    # any other mailbox control. The recovery-email form lives on Microsoft's
+    # sign-in/account surface, not on /mail/.
+    if "outlook.live.com/mail" in (getattr(page, "url", "") or "").casefold():
+        return False
+    # Microsoft may first render a proof-method chooser. The email option is
+    # a radio input, not a text field; select it and submit the chooser so the
+    # next state can prove whether a code was actually sent.
+    try:
+        radios = page.locator("input[type=radio]:visible")
+        radio_count = await radios.count()
+        for index in range(radio_count):
+            radio = radios.nth(index)
+            value = (await radio.get_attribute("value", timeout=500) or "").casefold()
+            title = (await radio.get_attribute("title", timeout=500) or "").casefold()
+            aria_label = (await radio.get_attribute("aria-label", timeout=500) or "").casefold()
+            try:
+                label_text = (await radio.locator("xpath=..").inner_text(timeout=500)).casefold()
+            except Exception:
+                label_text = ""
+            proof_text = f"{value} {title} {aria_label} {label_text}"
+            if not any(marker in proof_text for marker in ["email", "e-mail", "电子邮件", "邮箱", "邮件"]):
+                continue
+            if any(marker in proof_text for marker in ["phone", "sms", "短信", "authenticator", "身份验证器", "电话"]):
+                continue
+            try:
+                await radio.check(timeout=2000)
+            except Exception:
+                await radio.click(timeout=2000)
+            # The Chinese Microsoft page shown in production renders a
+            # separate text box after the radio is selected.  Its domain is
+            # fixed to @outlook.com, so only the local part must be entered.
+            local_part = security_email.rsplit("@", 1)[0].strip()
+            await wait_for_timeout_maybe_stop(page, 400, pause_controller, "Microsoft proof address field render")
+            await fill_first(
+                page,
+                [
+                    "input[name=proof]:not([type=radio])",
+                    "input[name*='proof' i]:not([type=radio])",
+                    "input[id^='iProof']:not([type=radio])",
+                    "input[id*='proof' i]:not([type=radio])",
+                    "input[aria-describedby*='iProof' i]:not([type=radio])",
+                ],
+                local_part,
+                timeout_ms=4000,
+            )
+            await click_submit(page)
+            await wait_for_timeout_maybe_stop(page, 3000, pause_controller, "Microsoft email proof method submit")
+            return True
+    except Exception:
+        pass
+
     filled = await fill_first(
         page,
         [
             "input[type=email]",
-            "input[name=email]",
-            "input[name=proof]",
-            "input[name*='proof' i]",
-            "input[name*='email' i]",
-            "input[id*='proof' i]",
-            "input[id*='email' i]",
-            "input[aria-label*='email' i]",
-            "input[aria-label*='邮箱' i]",
-            "input[aria-label*='电子邮件' i]",
-            "input[placeholder*='email' i]",
-            "input[placeholder*='邮箱' i]",
-            "input[placeholder*='电子邮件' i]",
+            "input[name=email]:not([type=radio])",
+            "input[name=proof]:not([type=radio])",
+            "input[name*='proof' i]:not([type=radio])",
+            "input[name*='email' i]:not([type=radio]):not([type=checkbox])",
+            "input[id*='proof' i]:not([type=radio])",
+            "input[id*='email' i]:not([type=radio]):not([type=checkbox])",
+            "input[aria-label*='email' i]:not([type=radio]):not([type=checkbox])",
+            "input[aria-label*='邮箱' i]:not([type=radio]):not([type=checkbox])",
+            "input[aria-label*='电子邮件' i]:not([type=radio]):not([type=checkbox])",
+            "input[placeholder*='email' i]:not([type=radio]):not([type=checkbox])",
+            "input[placeholder*='邮箱' i]:not([type=radio]):not([type=checkbox])",
+            "input[placeholder*='电子邮件' i]:not([type=radio]):not([type=checkbox])",
         ],
         security_email,
         timeout_ms=4000,
     )
+    if not filled:
+        # Forward-rule reauthentication uses a localized generic text input
+        # labelled only "电子邮件"/"Email".  Limit this fallback to the
+        # Microsoft verification surface and its send-code copy so it can
+        # never target Outlook's mailbox search box.
+        try:
+            body = (await page.locator("body").inner_text(timeout=1500)).casefold()
+        except Exception:
+            body = ""
+        if any(marker in body for marker in [
+            "验证你的电子邮件",
+            "发送验证码",
+            "verify your email",
+            "send a code",
+        ]):
+            filled = await fill_first(
+                page,
+                [
+                    "input:not([type=radio]):not([type=checkbox]):not([type=password]):not([type=hidden])",
+                ],
+                security_email,
+                timeout_ms=4000,
+            )
     if filled:
         await click_submit(page)
         await wait_for_timeout_maybe_stop(page, 3000, pause_controller, "Microsoft security email submit")
-    return filled
+        return True
+    return False
 
 
 def extract_code(text: str) -> str | None:
@@ -617,13 +742,31 @@ def parse_mail_row_time(text: str, now_epoch: float | None = None) -> float | No
         return None
     now_epoch = now_epoch if now_epoch is not None else time.time()
     local_now = time.localtime(now_epoch)
-    day_offset = -1 if any(marker in value.casefold() for marker in ["yesterday", "昨天", "前天"]) else 0
-    date_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", value)
+    lower_value = value.casefold()
+    # A numeric calendar date is authoritative.  Outlook otherwise labels
+    # older rows as relative dates; keep 前天 distinct from 昨天 so an old
+    # message cannot pass a request-time lower bound just because its clock
+    # value is later than the current request.
+    date_match = re.search(
+        r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b|\b(\d{1,2})月(\d{1,2})日",
+        value,
+    )
+    day_offset = 0
+    if not date_match:
+        if "前天" in value:
+            day_offset = -2
+        elif "yesterday" in lower_value or "昨天" in value:
+            day_offset = -1
     year, month, day = local_now.tm_year, local_now.tm_mon, local_now.tm_mday
     if date_match:
-        month, day = int(date_match.group(1)), int(date_match.group(2))
-        if date_match.group(3):
-            year = int(date_match.group(3))
+        if date_match.group(1):
+            month, day = int(date_match.group(1)), int(date_match.group(2))
+            explicit_year = date_match.group(3)
+        else:
+            month, day = int(date_match.group(4)), int(date_match.group(5))
+            explicit_year = None
+        if explicit_year:
+            year = int(explicit_year)
             if year < 100:
                 year += 2000
     clock = re.search(r"\b(\d{1,2}):(\d{2})\s*([AaPp][Mm])?\b", value)
@@ -641,26 +784,142 @@ def parse_mail_row_time(text: str, now_epoch: float | None = None) -> float | No
         return None
 
 
+def microsoft_security_mail_row_selector() -> str:
+    return ", ".join(["[role=option]", "[data-convid]", "[data-itemid]", "[role=listitem]"])
+
+
+def microsoft_masked_email(email: str) -> str:
+    """Build the mask used by real Microsoft security-code messages."""
+    value = (email or "").strip().casefold()
+    if "@" not in value:
+        return ""
+    local, domain = value.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[:1] + "**"
+    else:
+        masked_local = local[:2] + "**" + local[-1]
+    return f"{masked_local}@{domain}"
+
+
+def is_microsoft_security_mail_row(text: str, target_email: str | None = None) -> bool:
+    """Match the actual Microsoft code-mail sender/subject/body shape."""
+    value = " ".join((text or "").split())
+    lower = value.casefold()
+    chinese_shape = (
+        re.search(r"Microsoft\s*(?:帐户|账户)团队", value, re.I)
+        and re.search(r"个人\s+Microsoft\s*(?:帐户|账户)\s*安全代码", value, re.I)
+        and "安全代码" in value
+    )
+    english_shape = (
+        re.search(r"Microsoft\s+account\s+team", value, re.I)
+        and re.search(r"Microsoft\s+account\s+security\s+code", value, re.I)
+    )
+    if not (chinese_shape or english_shape):
+        return False
+    if target_email:
+        masked = microsoft_masked_email(target_email)
+        if masked and masked not in lower:
+            return False
+    return extract_code(value) is not None
+
+
+def should_accept_microsoft_security_mail_row(
+    text: str,
+    row_epoch: float | None,
+    message_ids: set[str],
+    not_before_epoch: float | None,
+    exclude_message_ids: set[str] | None,
+    target_email: str | None = None,
+) -> bool:
+    """Pure decision gate for replay tests and the live Outlook row scanner."""
+    if not is_microsoft_security_mail_row(text, target_email):
+        return False
+    if not_before_epoch is None:
+        return True
+    request_minute = not_before_epoch - (not_before_epoch % 60)
+    if row_epoch is None or row_epoch < not_before_epoch:
+        # A stable new ID can still legitimately display the same HH:MM as
+        # the request; the UI has no seconds field. Rows from an earlier
+        # displayed minute remain impossible to accept.
+        if row_epoch is None or row_epoch < request_minute:
+            return False
+    if exclude_message_ids is not None and message_ids & exclude_message_ids:
+        return False
+    # Without a stable ID proving that the row was created after the request,
+    # a same-minute Outlook row is ambiguous because the UI only shows HH:MM.
+    if not message_ids or not exclude_message_ids:
+        if row_epoch <= request_minute:
+            return False
+    return True
+
+
+async def microsoft_security_mail_ids_from_row(row) -> set[str]:
+    """Read conversation/item IDs from a row and its nested Outlook nodes."""
+    try:
+        values = await row.evaluate(
+            """(element) => {
+                const nodes = [element, ...element.querySelectorAll('[data-convid], [data-itemid]')];
+                const ids = [];
+                for (const node of nodes) {
+                    for (const attribute of ['data-convid', 'data-itemid']) {
+                        const value = node.getAttribute(attribute);
+                        if (value) ids.push(value);
+                    }
+                }
+                return ids;
+            }"""
+        )
+        return {value for value in (values or []) if value}
+    except Exception:
+        ids: set[str] = set()
+        for attribute in ["data-convid", "data-itemid"]:
+            try:
+                value = await row.get_attribute(attribute, timeout=500)
+                if value:
+                    ids.add(value)
+            except Exception:
+                pass
+        return ids
+
+
+async def collect_microsoft_security_mail_ids(page: Page) -> set[str]:
+    """Capture existing message IDs before requesting a new security code."""
+    # The security mailbox can be left on a stale /mail/ shell after a
+    # persisted-session reuse. In that state Outlook may not have rendered
+    # list-row IDs yet. Always return to the inbox and wait for real rows
+    # before taking the pre-request snapshot. This refresh is isolated to the
+    # security mailbox page and happens before the new code is sent.
+    try:
+        await page.goto(OUTLOOK_MAIL_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+    except Exception:
+        pass
+    ids: set[str] = set()
+    rows = page.locator(microsoft_security_mail_row_selector())
+    try:
+        row_count = 0
+        for _ in range(3):
+            row_count = await rows.count()
+            if row_count:
+                break
+            await page.wait_for_timeout(1000)
+        for index in range(min(row_count, 50)):
+            row = rows.nth(index)
+            ids.update(await microsoft_security_mail_ids_from_row(row))
+    except Exception:
+        pass
+    return ids
+
+
 async def open_latest_microsoft_security_mail(
     page: Page,
     not_before_epoch: float | None = None,
-    row_time_slack_seconds: int = 90,
+    row_time_slack_seconds: int = 0,
+    exclude_message_ids: set[str] | None = None,
+    target_email: str | None = None,
 ) -> bool:
     """Open the newest real Microsoft security-code message row, preferring unread rows."""
-    row_selector = ", ".join(
-        [
-            "[role=option]",
-            "[data-convid]",
-            "[data-itemid]",
-            "[role=listitem]",
-        ]
-    )
-    rows = page.locator(row_selector).filter(
-        has_text=re.compile(
-            r"(?:Microsoft.*(?:security|code|安全|代码|验证))|(?:(?:security|code|安全|代码|验证).*Microsoft)",
-            re.I,
-        )
-    )
+    rows = page.locator(microsoft_security_mail_row_selector())
     candidates: list[tuple[bool, Any]] = []
     try:
         count = min(await rows.count(), 20)
@@ -674,10 +933,17 @@ async def open_latest_microsoft_security_mail(
                         (await row.get_attribute("title")) or "",
                     ]
                 )
-                if not_before_epoch is not None:
-                    row_epoch = parse_mail_row_time(text)
-                    if row_epoch is None or row_epoch < not_before_epoch - row_time_slack_seconds:
-                        continue
+                message_ids = await microsoft_security_mail_ids_from_row(row)
+                row_epoch = parse_mail_row_time(text) if not_before_epoch is not None else None
+                if not should_accept_microsoft_security_mail_row(
+                    text,
+                    row_epoch,
+                    message_ids,
+                    not_before_epoch,
+                    exclude_message_ids,
+                    target_email,
+                ):
+                    continue
                 unread = bool(re.search(r"\bunread\b|未读", text, re.I))
                 candidates.append((unread, row))
             except Exception:
@@ -722,8 +988,16 @@ async def get_security_code(
     timeout_seconds: int,
     pause_controller=None,
     not_before_epoch: float | None = None,
+    exclude_message_ids: set[str] | None = None,
 ) -> str:
     deadline = time.monotonic() + timeout_seconds
+    # Do not inspect the mailbox immediately after Microsoft confirms the
+    # request.  A previous unread message can be visible before the new mail
+    # reaches the list, and Outlook often displays only minute precision.
+    delivery_grace_seconds = 8
+    earliest_search_epoch = (
+        not_before_epoch + delivery_grace_seconds if not_before_epoch is not None else None
+    )
     queries = [
         "isread:no from:accountprotection.microsoft.com",
         "from:accountprotection.microsoft.com",
@@ -732,9 +1006,22 @@ async def get_security_code(
     while time.monotonic() < deadline:
         if pause_controller and pause_controller.should_stop():
             raise RuntimeError(f"Stopped while waiting for security code for {target_email}.")
+        if earliest_search_epoch is not None and time.time() < earliest_search_epoch:
+            await wait_for_timeout_maybe_stop(
+                page,
+                min(1000, max(100, int((earliest_search_epoch - time.time()) * 1000))),
+                pause_controller,
+                "Microsoft security-code delivery grace period",
+            )
+            continue
         await page.goto(OUTLOOK_MAIL_URL, wait_until="domcontentloaded")
         await wait_for_timeout_maybe_stop(page, 1500, pause_controller, "Outlook latest security-code mail load")
-        if await open_latest_microsoft_security_mail(page, not_before_epoch=not_before_epoch):
+        if await open_latest_microsoft_security_mail(
+            page,
+            not_before_epoch=not_before_epoch,
+            exclude_message_ids=exclude_message_ids,
+            target_email=target_email,
+        ):
             await wait_for_timeout_maybe_stop(page, 1200, pause_controller, "Outlook latest security-code message open")
             code = await extract_security_code_from_open_message(page)
             if code:
@@ -745,7 +1032,12 @@ async def get_security_code(
             if time.monotonic() >= deadline:
                 break
             await search_security_mail(page, query, pause_controller)
-            opened = await open_latest_microsoft_security_mail(page, not_before_epoch=not_before_epoch)
+            opened = await open_latest_microsoft_security_mail(
+                page,
+                not_before_epoch=not_before_epoch,
+                exclude_message_ids=exclude_message_ids,
+                target_email=target_email,
+            )
             if opened:
                 await wait_for_timeout_maybe_stop(page, 1200, pause_controller, "Outlook security-code message open")
                 code = await extract_security_code_from_open_message(page)
@@ -842,13 +1134,35 @@ async def submit_code(page: Page, code: str, pause_controller=None) -> None:
             segmented_inputs = inputs
             segmented_count = await inputs.count()
             segmented_indexes = list(range(segmented_count))
-        if segmented_count < len(normalized_code):
+        capacities: list[int] = []
+        for segmented_index in segmented_indexes:
+            item = segmented_inputs.nth(segmented_index)
+            try:
+                maxlength = (await item.get_attribute("maxlength", timeout=500) or "").strip()
+                capacity = int(maxlength) if maxlength.isdigit() and int(maxlength) > 0 else 1
+            except Exception:
+                capacity = 1
+            capacities.append(capacity)
+        # Some Microsoft localized builds render three fields, each accepting
+        # two characters, while the six-box build renders one character per
+        # field.  Infer the equal-width capacity only when the code divides
+        # evenly; otherwise keep the strict maxlength-based safety gate.
+        if sum(capacities) < len(normalized_code) and segmented_count and len(normalized_code) % segmented_count == 0:
+            inferred_capacity = len(normalized_code) // segmented_count
+            if inferred_capacity > 1 and all(capacity == 1 for capacity in capacities):
+                capacities = [inferred_capacity] * segmented_count
+        if sum(capacities) < len(normalized_code):
             raise RuntimeError(
                 f"Microsoft security code input has {segmented_count} boxes, "
                 f"but the code has {len(normalized_code)} characters."
             )
-        for index, character in enumerate(normalized_code):
-            await fill_security_code_control(segmented_inputs.nth(segmented_indexes[index]), character)
+        offset = 0
+        for index, capacity in enumerate(capacities):
+            chunk = normalized_code[offset : offset + capacity]
+            if not chunk:
+                break
+            await fill_security_code_control(segmented_inputs.nth(segmented_indexes[index]), chunk)
+            offset += len(chunk)
         # The six-box Microsoft control may auto-submit as soon as the last
         # digit is entered and close/navigate the OAuth popup. That is a
         # successful submission path, not a reason to refresh the mailbox.

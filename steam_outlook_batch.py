@@ -81,6 +81,52 @@ def safe_artifact_name(text: str, limit: int = 80) -> str:
     return (compact or "page")[:limit]
 
 
+def disable_password_manager_profile(profile: Path, log=print) -> None:
+    """Disable Chromium's native save-password UI before a persistent launch."""
+    profile.mkdir(parents=True, exist_ok=True)
+    preference_paths = [profile / "Default" / "Preferences", profile / "Preferences"]
+    for preference_path in preference_paths:
+        try:
+            preference_path.parent.mkdir(parents=True, exist_ok=True)
+            if preference_path.exists():
+                preferences = json.loads(preference_path.read_text(encoding="utf-8"))
+            else:
+                preferences = {}
+            preferences["credentials_enable_service"] = False
+            preferences["password_manager_enabled"] = False
+            preferences.setdefault("profile", {})["password_manager_enabled"] = False
+            preferences.setdefault("autofill", {})["profile_enabled"] = False
+            temporary_path = preference_path.with_suffix(".codex.tmp")
+            temporary_path.write_text(
+                json.dumps(preferences, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            temporary_path.replace(preference_path)
+        except Exception as exc:
+            log(f"Could not disable native password-save preferences for {profile}: {exc}")
+
+
+async def dismiss_password_save_prompt(page: Page, log=print) -> bool:
+    """Close page-visible password-save prompts; native bubbles are disabled at launch."""
+    try:
+        body = await page.locator("body").inner_text(timeout=1000)
+    except Exception:
+        body = ""
+    normalized = body.casefold()
+    if not any(marker in normalized for marker in ["save password", "保存密码", "保存登录信息"]):
+        return False
+    for pattern in [r"^Never$", r"^No thanks$", r"^Not now$", r"^不保存$", r"^关闭$", r"^取消$"]:
+        if await click_first(page, [pattern], timeout_ms=800):
+            log("Closed browser save-password prompt.")
+            return True
+    try:
+        await page.keyboard.press("Escape")
+        log("Sent Escape to close browser save-password prompt.")
+        return True
+    except Exception:
+        return False
+
+
 async def wait_for_timeout_with_stop(
     page: Page,
     milliseconds: int,
@@ -403,6 +449,7 @@ class SteamAccount:
     backup_security_email: str = ""
     security_email_password: str = ""
     security_binding_required: bool = False
+    external_target: bool = False
 
     @property
     def password(self) -> str:
@@ -670,6 +717,12 @@ def read_pending_accounts(args) -> tuple[list[SteamAccount], dict[str, Any], str
             if backup_security_email_idx is not None and backup_security_email_idx < len(padded)
             else ""
         )
+        # A previously written J value can become unusable later when
+        # Microsoft rate-limits that security mailbox. Treat it as unbound so
+        # the next refresh assigns a healthy mailbox from the pool and the row
+        # re-verifies the replacement before continuing.
+        if backup_security_email.casefold() in blocked_security_mailboxes:
+            backup_security_email = ""
         if not email:
             continue
         if start_row_number and row_number < start_row_number:
@@ -770,39 +823,46 @@ def write_sheet_verified(
     package_root: Path = feishu_tool.DEFAULT_LARK_MCP_ROOT,
 ) -> dict[str, Any]:
     """Write a cell range and read it back before the workflow treats it as committed."""
-    response = feishu_tool.write_sheet(
-        config,
-        spreadsheet_token,
-        sheet_id,
-        cell_range,
-        values,
-        use_uat=use_uat,
-        package_root=package_root,
-    )
-    if response.get("code") != 0:
-        raise RuntimeError(f"Feishu write failed for {cell_range}: {response}")
-    readback = feishu_tool.read_sheet(
-        config,
-        spreadsheet_token,
-        sheet_id,
-        cell_range,
-        use_uat=use_uat,
-        package_root=package_root,
-    )
-    if readback.get("code") != 0:
-        raise RuntimeError(f"Feishu readback failed for {cell_range}: {readback}")
-    actual = readback.get("data", {}).get("valueRange", {}).get("values", [])
     expected_normalized = [[cell_text(cell) for cell in row] for row in values]
-    actual_normalized = [
-        [cell_text(cell) for cell in row[: len(expected_normalized[index])]]
-        for index, row in enumerate(actual[: len(expected_normalized)])
-    ]
-    if actual_normalized != expected_normalized:
-        raise RuntimeError(
-            f"Feishu write verification failed for {cell_range}: "
-            f"expected={expected_normalized!r}, actual={actual_normalized!r}"
+    last_error = ""
+    for attempt in range(1, 4):
+        response = feishu_tool.write_sheet(
+            config,
+            spreadsheet_token,
+            sheet_id,
+            cell_range,
+            values,
+            use_uat=use_uat,
+            package_root=package_root,
         )
-    return response
+        if response.get("code") != 0:
+            last_error = f"Feishu write failed for {cell_range}: {response}"
+        else:
+            readback = feishu_tool.read_sheet(
+                config,
+                spreadsheet_token,
+                sheet_id,
+                cell_range,
+                use_uat=use_uat,
+                package_root=package_root,
+            )
+            if readback.get("code") != 0:
+                last_error = f"Feishu readback failed for {cell_range}: {readback}"
+            else:
+                actual = readback.get("data", {}).get("valueRange", {}).get("values", [])
+                actual_normalized = [
+                    [cell_text(cell) for cell in row[: len(expected_normalized[index])]]
+                    for index, row in enumerate(actual[: len(expected_normalized)])
+                ]
+                if actual_normalized == expected_normalized:
+                    return response
+                last_error = (
+                    f"Feishu write verification failed for {cell_range}: "
+                    f"expected={expected_normalized!r}, actual={actual_normalized!r}"
+                )
+        if attempt < 3:
+            time.sleep(attempt)
+    raise RuntimeError(last_error or f"Feishu write verification failed for {cell_range}.")
 
 
 def ensure_forward_rule_header(args, feishu_config: dict[str, Any], spreadsheet_token: str, sheet_id: str) -> None:
@@ -1193,6 +1253,54 @@ def extract_steam_guard_code(text: str) -> str | None:
     return None
 
 
+def outlook_rules_surface_detected(url: str, body: str) -> bool:
+    """Return True only when the current page is the actual Rules/Forwarding surface."""
+    url_lower = (url or "").casefold()
+    body_lower = (body or "").casefold()
+    if "outlook.live.com" not in url_lower:
+        return False
+    settings_url = any(
+        marker in url_lower
+        for marker in [
+            "/options/mail/rules",
+            "/options/mail/forwarding",
+            "/mail/options/mail/rules",
+            "/mail/options/mail/forwarding",
+        ]
+    )
+    page_marker = any(
+        marker in body_lower
+        for marker in [
+            "rules",
+            "forwarding",
+            "enable forwarding",
+            "add new rule",
+            "redirect to",
+            "forward to",
+            "规则",
+            "转发",
+            "启用转发",
+            "添加新规则",
+            "新建规则",
+            "重定向到",
+        ]
+    )
+    strong_marker = any(
+        marker in body_lower
+        for marker in [
+            "mail rules",
+            "inbox rules",
+            "rules settings",
+            "forwarding settings",
+            "邮件规则",
+            "收件箱规则",
+            "规则设置",
+            "转发设置",
+        ]
+    )
+    return page_marker and (settings_url or strong_marker)
+
+
 async def open_latest_steam_guard_mail(page: Page) -> bool:
     """Open the newest real Steam Guard message row, preferring unread mail."""
     rows = page.locator("[role=option], [data-convid], [data-itemid], [role=listitem]").filter(
@@ -1338,11 +1446,17 @@ async def get_microsoft_security_code_from_mailbox(
     on_manual_wait=lambda message: None,
     on_manual_resume=lambda message: None,
     not_before_epoch: float | None = None,
+    exclude_message_ids: set[str] | None = None,
 ) -> str:
     from outlook_batch_login import get_security_code
 
     deadline = time.monotonic() + timeout_seconds
     next_log = 0.0
+    if exclude_message_ids is not None and not exclude_message_ids:
+        log(
+            f"Microsoft security-mail pre-request snapshot is empty for {target_email}; "
+            "same-minute messages will be rejected until a later dated row appears."
+        )
     while time.monotonic() < deadline:
         if pause_controller and pause_controller.should_stop():
             raise RuntimeError(f"Stopped while waiting for Microsoft security code for {target_email}.")
@@ -1378,6 +1492,7 @@ async def get_microsoft_security_code_from_mailbox(
                 min(20, remaining),
                 pause_controller,
                 not_before_epoch=not_before_epoch,
+                exclude_message_ids=exclude_message_ids,
             )
         except TimeoutError:
             log(f"Microsoft security code not found yet for {target_email}; retrying mailbox search.")
@@ -1494,10 +1609,17 @@ async def request_microsoft_security_email_code(
     already sent the message.  Treat each state explicitly and never start
     reading the mailbox unless the target page confirms that a code was sent.
     """
+    if "outlook.live.com/mail" in (getattr(page, "url", "") or "").casefold():
+        log(
+            f"Microsoft security-email request blocked for {account_email}: "
+            "target page is an Outlook mailbox/search page, not a verification page."
+        )
+        return False
     if await microsoft_security_code_entry_visible(page):
         log(f"Microsoft already sent a security code for {account_email}; waiting for mailbox delivery.")
         return time.time() - 90
 
+    log(f"Microsoft security verification method detected for {account_email}; selecting email delivery.")
     submitted = await submit_security_email(page, bind_email, pause_controller)
     if not submitted and allow_add_security_method:
         await click_first(
@@ -1510,6 +1632,7 @@ async def request_microsoft_security_email_code(
             timeout_ms=5000,
         )
         await wait_for_timeout_with_stop(page, 1200, pause_controller, "Microsoft security-email method open")
+        log(f"Microsoft email delivery method opened for {account_email}; submitting recovery address.")
         submitted = await submit_security_email(page, bind_email, pause_controller)
     if not submitted:
         await click_first(
@@ -1528,6 +1651,7 @@ async def request_microsoft_security_email_code(
             [
                 r"Send.*code", r"Send code to.*", r"already have a code",
                 r"发送.*代码", r"发送验证码", r"将代码发送到.*", r"将验证码发送到.*",
+                r"发送电子邮件", r"Send an email", r"Email me a code",
                 r"Get code", r"获取代码",
             ],
             timeout_ms=3000,
@@ -1549,6 +1673,7 @@ async def request_microsoft_security_email_code(
         return False
 
     code_requested_at = time.time()
+    log(f"Microsoft security-email send control submitted for {account_email}; waiting for the six-digit code page.")
 
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -1643,10 +1768,13 @@ async def launch_persistent_context_with_fallback(
     log,
     label: str,
 ) -> BrowserContext:
+    disable_password_manager_profile(Path(profile), log)
     browser_args = [
         f"--window-position={x},{y}",
+        "--password-store=basic",
+        "--credentials-enable-service=false",
         "--disable-save-password-bubble",
-        "--disable-features=PasswordManagerOnboarding,PasswordManager,PasswordLeakDetection",
+        "--disable-features=PasswordManagerOnboarding,PasswordManager,PasswordLeakDetection,PasswordManagerSaveBrowser,PasswordManagerSigninIntercept",
     ]
     try:
         context = await playwright.chromium.launch_persistent_context(
@@ -1718,10 +1846,13 @@ async def restore_email_scoped_outlook_session(context: BrowserContext, scope: s
 async def launch_isolated_target_context(playwright, email: str, x: int, y: int, log) -> tuple[BrowserContext, Path]:
     """Open a persistent target-mailbox session that cannot inherit another email's cookies."""
     profile = email_scoped_outlook_profile("target", email)
+    disable_password_manager_profile(profile, log)
     browser_args = [
         f"--window-position={x},{y}",
+        "--password-store=basic",
+        "--credentials-enable-service=false",
         "--disable-save-password-bubble",
-        "--disable-features=PasswordManagerOnboarding,PasswordManager,PasswordLeakDetection",
+        "--disable-features=PasswordManagerOnboarding,PasswordManager,PasswordLeakDetection,PasswordManagerSaveBrowser,PasswordManagerSigninIntercept",
     ]
     try:
         context = await playwright.chromium.launch_persistent_context(
@@ -1741,10 +1872,13 @@ async def launch_isolated_target_context(playwright, email: str, x: int, y: int,
 async def launch_isolated_security_context(playwright, email: str, x: int, y: int, log) -> tuple[BrowserContext, Path]:
     """Open a persistent security-mailbox session scoped to exactly one email."""
     profile = email_scoped_outlook_profile("security", email)
+    disable_password_manager_profile(profile, log)
     browser_args = [
         f"--window-position={x},{y}",
+        "--password-store=basic",
+        "--credentials-enable-service=false",
         "--disable-save-password-bubble",
-        "--disable-features=PasswordManagerOnboarding,PasswordManager,PasswordLeakDetection",
+        "--disable-features=PasswordManagerOnboarding,PasswordManager,PasswordLeakDetection,PasswordManagerSaveBrowser,PasswordManagerSigninIntercept",
     ]
     try:
         context = await playwright.chromium.launch_persistent_context(
@@ -1971,7 +2105,14 @@ async def wait_for_outlook_inbox(
             log("Microsoft passkey request cancelled through the browser login flow.")
         await cancel_passkey_prompt(page, log, timeout_seconds=5, pause_controller=pause_controller)
         await handle_outlook_browser_prompts(page, log, timeout_seconds=2, pause_controller=pause_controller)
-        await handle_microsoft_post_login_prompts(page, log, timeout_seconds=3, pause_controller=pause_controller)
+        await handle_microsoft_post_login_prompts(
+            page,
+            log,
+            timeout_seconds=3,
+            pause_controller=pause_controller,
+            on_manual_wait=on_manual_wait,
+            on_manual_resume=on_manual_resume,
+        )
         if await redirect_microsoft_account_home_to_outlook(page, log, pause_controller):
             deadline = time.monotonic() + timeout_seconds
             continue
@@ -2241,12 +2382,20 @@ async def current_outlook_mailbox_matches(
     return False
 
 
-async def handle_microsoft_post_login_prompts(page: Page, log=print, timeout_seconds: int = 12, pause_controller=None) -> None:
+async def handle_microsoft_post_login_prompts(
+    page: Page,
+    log=print,
+    timeout_seconds: int = 12,
+    pause_controller=None,
+    on_manual_wait=lambda message: None,
+    on_manual_resume=lambda message: None,
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     last_prompt = ""
     while time.monotonic() < deadline:
         if pause_controller and pause_controller.should_stop():
             raise RuntimeError("Stopped while handling Microsoft post-login prompts.")
+        await dismiss_password_save_prompt(page, log)
         try:
             body = await page.locator("body").inner_text(timeout=3000)
         except Exception:
@@ -2298,7 +2447,35 @@ async def handle_microsoft_post_login_prompts(page: Page, log=print, timeout_sec
 
         return
     if last_prompt:
-        log(f"{last_prompt}; post-login prompt handling timed out; {await page_state_summary(page)}")
+        # A security-code/recovery-email page is an expected hand-off to the
+        # verification state machine.  Every other prompt that survives the
+        # bounded handler is an unhandled page and must fail this row rather
+        # than silently letting the workflow continue on the wrong surface.
+        if await security_challenge_visible(page) or await is_recovery_email_setup_page(page):
+            log(f"{last_prompt}; handing the recognized verification page to the security flow.")
+            return
+        manual_message = (
+            "Microsoft 登录后出现自动化未识别页面，已暂停当前账号供人工/ChatGPT 处理。"
+            "请在对应浏览器窗口完成页面操作，回到控制台点击“确认完成，继续”；"
+            "程序只会复核一次，仍未进入已知状态就停止当前批次，不会循环重试。"
+        )
+        await wait_for_manual_continue(
+            manual_message,
+            log,
+            pause_controller,
+            on_manual_wait,
+            on_manual_resume,
+            page=page,
+            screenshot_path=Path("errors") / "microsoft_post_login_unhandled.png",
+            screenshot_label="Microsoft post-login unhandled page",
+        )
+        if await security_challenge_visible(page) or await is_recovery_email_setup_page(page):
+            return
+        raise RuntimeError(
+            f"Microsoft post-login prompt handling timed out; "
+            f"Microsoft post-login page remained unhandled after one manual intervention: "
+            f"{await page_state_summary(page)}"
+        )
 
 
 async def connect_security_context(playwright, args, log=print) -> tuple[BrowserContext, Page]:
@@ -2627,6 +2804,17 @@ def is_browser_context_closed_error(exc: BaseException) -> bool:
 
 def is_outlook_context_retryable_error(exc: BaseException) -> bool:
     message = str(exc).casefold()
+    if any(
+        marker in message
+        for marker in [
+            "security code was rejected",
+            "security-email code request did not reach",
+            "收码受限",
+            "验证码被拒绝",
+            "security mailbox marked",
+        ]
+    ):
+        return False
     return is_browser_context_closed_error(exc) or any(
         marker in message
         for marker in [
@@ -2634,6 +2822,47 @@ def is_outlook_context_retryable_error(exc: BaseException) -> bool:
             "timed out waiting for outlook inbox after microsoft login",
             "could not find microsoft password input",
             "could not find microsoft email input",
+            "navigation is interrupted by another navigation",
+            "page.goto: navigation to",
+            "规则编辑器未",
+            "规则验证窗口未",
+            "save/save button",
+            "save/保存",
+            "stop processing more rules",
+            "input of type \"radio\" cannot be filled",
+        ]
+    )
+
+
+def is_non_skippable_verification_error(exc: BaseException) -> bool:
+    """Security-code failures must stop the batch instead of skipping an account."""
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in [
+            "security code was rejected",
+            "microsoft rejected the security code",
+            "security code input",
+            "no resend control",
+            "安全码被拒绝",
+            "验证码被拒绝",
+            "安全验证码",
+            "绑定安全邮箱不能写回",
+            "安全邮箱不能写回",
+            "feishu write verification failed",
+            "feishu write failed",
+            "feishu readback failed",
+            "转发规则重新验证安全码被拒绝",
+            "security-email code request did not reach",
+            "http put failed",
+            "http get failed",
+            "401 unauthorized",
+            "99991677",
+            "token expired",
+            "authentication token expired",
+            "could not find microsoft password input",
+            "microsoft password input",
+            "security mailbox login",
         ]
     )
 
@@ -2713,6 +2942,13 @@ async def try_complete_security_email_binding(
     on_manual_resume=lambda message: None,
     on_security_mailbox_blocked=lambda email, reason: None,
 ) -> bool:
+    from outlook_batch_login import collect_microsoft_security_mail_ids
+
+    existing_security_mail_ids = await collect_microsoft_security_mail_ids(security_page)
+    log(
+        f"Captured {len(existing_security_mail_ids)} existing Microsoft security-mail IDs "
+        f"before requesting a code for {account.email}."
+    )
     code_requested_at = await request_microsoft_security_email_code(
         target_page,
         bind_email,
@@ -2733,6 +2969,7 @@ async def try_complete_security_email_binding(
         on_manual_wait,
         on_manual_resume,
         not_before_epoch=code_requested_at,
+        exclude_message_ids=existing_security_mail_ids,
     )
     if not await submit_microsoft_security_code_with_validation(
         target_page,
@@ -2742,6 +2979,13 @@ async def try_complete_security_email_binding(
         pause_controller,
     ):
         raise RuntimeError(f"Microsoft security-email verification code was rejected for {account.email}.")
+    await handle_microsoft_post_login_prompts(
+        target_page,
+        log,
+        pause_controller=pause_controller,
+        on_manual_wait=on_manual_wait,
+        on_manual_resume=on_manual_resume,
+    )
     await wait_for_timeout_with_stop(target_page, 2500, pause_controller, "Microsoft security-email binding completion")
     if await microsoft_security_code_entry_visible(target_page):
         raise RuntimeError(
@@ -2792,6 +3036,59 @@ async def complete_recovery_email_setup(
         )
         return False
     return True
+
+
+async def ensure_microsoft_password_reauthenticated(
+    page: Page,
+    account: SteamAccount,
+    log,
+    pause_controller=None,
+) -> None:
+    """Handle Microsoft's password recheck before opening recovery-email setup."""
+    password_input = page.locator(
+        "input[type='password']:visible, input[name='passwd']:visible, "
+        "input[autocomplete='current-password']:visible"
+    ).first
+    if not await password_input.count():
+        return
+    log(f"Microsoft recovery-email page requested target mailbox password again for {account.email}.")
+    await password_input.fill(account.email_password, timeout=5000)
+    submit = page.locator("button[type='submit']:visible, input[type='submit']:visible").first
+    if await submit.count():
+        await submit.click(timeout=4000)
+    elif not await click_first(page, [r"^Next$", r"^下一步$", r"^Sign in$", r"^登录$"], timeout_ms=4000):
+        await password_input.press("Enter")
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        current_url = (page.url or "").casefold()
+        try:
+            body = await page.locator("body").inner_text(timeout=1500)
+        except Exception:
+            body = ""
+        lower = body.casefold()
+        if any(marker in lower for marker in ["incorrect password", "password is incorrect", "wrong password"]):
+            raise RuntimeError(f"Microsoft recovery-email password reauthentication failed for {account.email}.")
+        if any(marker in body for marker in ["密码不正确", "密码错误"]):
+            raise RuntimeError(f"Microsoft recovery-email password reauthentication failed for {account.email}.")
+        remaining_password_inputs = page.locator(
+            "input[type='password']:visible, input[name='passwd']:visible, "
+            "input[autocomplete='current-password']:visible"
+        )
+        if not await remaining_password_inputs.count():
+            if "ppsecure/post.srf" in current_url:
+                await wait_for_timeout_with_stop(
+                    page,
+                    500,
+                    pause_controller,
+                    "Microsoft recovery-email password relay",
+                )
+                continue
+            log(f"Microsoft recovery-email password reauthentication completed for {account.email}.")
+            return
+        await wait_for_timeout_with_stop(page, 500, pause_controller, "Microsoft recovery-email password reauthentication")
+    raise TimeoutError(
+        f"Microsoft recovery-email password reauthentication did not leave the password page for {account.email}."
+    )
 
 
 async def detect_outlook_blocking_page(page: Page) -> tuple[str, str] | None:
@@ -2869,6 +3166,26 @@ async def submit_security_email_or_record_failure(
     )
 
 
+async def resend_microsoft_security_code(page: Page, pause_controller=None) -> bool:
+    """Request a fresh Microsoft code without leaving the current account flow."""
+    resent = await click_first(
+        page,
+        [
+            r"Send.*code", r"Get a new code", r"Didn't get a code",
+            r"发送.*代码", r"获取新代码", r"没有收到代码", r"重新发送",
+        ],
+        timeout_ms=3000,
+    )
+    if resent:
+        await wait_for_timeout_with_stop(
+            page,
+            1500,
+            pause_controller,
+            "Microsoft security-code resend",
+        )
+    return resent
+
+
 async def try_change_microsoft_password(
     page: Page,
     current_password: str,
@@ -2928,6 +3245,7 @@ async def run_mail_security_maintenance(
         await page.goto("https://account.live.com/proofs/manage/additional", wait_until="domcontentloaded")
         await wait_for_timeout_with_stop(page, 5000, pause_controller, "Microsoft security binding page load")
         await cancel_passkey_prompt(page, log, timeout_seconds=8, pause_controller=pause_controller)
+        await ensure_microsoft_password_reauthenticated(page, account, log, pause_controller)
         security_binding_completed = bool(
             security_page
             and await try_complete_security_email_binding(
@@ -2955,8 +3273,32 @@ async def run_mail_security_maintenance(
                 screenshot_label="Microsoft security binding",
             )
         else:
-            await page.goto("https://account.live.com/proofs/manage/additional", wait_until="domcontentloaded")
-            await wait_for_timeout_with_stop(page, 3000, pause_controller, "Microsoft security binding verification page")
+            # Code submission can finish on login.srf/privacy-notice and
+            # only then settle on the security-management page.  Give the
+            # post-login prompt handler one bounded pass before writeback.
+            for security_page_attempt in range(2):
+                await page.goto("https://account.live.com/proofs/manage/additional", wait_until="domcontentloaded")
+                await wait_for_timeout_with_stop(
+                    page,
+                    3000,
+                    pause_controller,
+                    "Microsoft security binding verification page",
+                )
+                await handle_microsoft_post_login_prompts(
+                    page,
+                    log,
+                    pause_controller=pause_controller,
+                    on_manual_wait=on_manual_wait,
+                    on_manual_resume=on_manual_resume,
+                )
+                current_url = (page.url or "").casefold()
+                if "account.live.com/proofs/manage" in current_url:
+                    break
+                if security_page_attempt == 0:
+                    log(
+                        "Microsoft security-management page has not settled after code submission; "
+                        "reloading it once after post-login prompt handling."
+                    )
         await ensure_security_binding_ready_for_writeback(page, bind_email, log)
     if bind_email:
         ensure_backup_security_email_header(args, feishu_config, spreadsheet_token, sheet_id)
@@ -3069,23 +3411,7 @@ async def open_outlook_rules_settings(
             ):
                 continue
             body = await page.locator("body").inner_text(timeout=5000)
-            if any(
-                marker in body.casefold()
-                for marker in [
-                    "rules",
-                    "forwarding",
-                    "enable forwarding",
-                    "add new rule",
-                    "redirect to",
-                    "forward to",
-                    "规则",
-                    "转发",
-                    "启用转发",
-                    "添加新规则",
-                    "新建规则",
-                    "重定向到",
-                ]
-            ):
+            if outlook_rules_surface_detected(url, body):
                 log(f"Opened Outlook forwarding/rules settings: {url}")
                 return
             log(f"Outlook forwarding/rules URL did not show expected markers: {await page_state_summary(page)}")
@@ -3128,7 +3454,29 @@ async def open_outlook_rules_settings(
     if not await click_first(page, [r"^Rules$", r"^规则$"], timeout_ms=1500):
         await click_first(page, [r"^Forwarding$", r"^转发$"], timeout_ms=1500)
     await wait_for_timeout_with_stop(page, 3000, pause_controller, "Outlook rules settings panel open")
-    log(f"Opened Outlook settings panel; please confirm the Rules/Forwarding page is visible. {await page_state_summary(page)}")
+    final_url = page.url
+    final_body = await page.locator("body").inner_text(timeout=5000)
+    if not outlook_rules_surface_detected(final_url, final_body):
+        await wait_for_manual_continue(
+            "Outlook 规则/转发页未被自动识别，已暂停当前账号供人工/ChatGPT 处理。"
+            "请把页面处理到 Rules/规则或 Forwarding/转发设置页，再点击“确认完成，继续”。"
+            "程序只复核一次，仍不匹配就停止当前批次，不会反复重试。",
+            log,
+            pause_controller,
+            on_manual_wait,
+            on_manual_resume,
+            page=page,
+            screenshot_path=Path("errors") / "outlook_rules_unhandled.png",
+            screenshot_label="Outlook rules unhandled page",
+        )
+        final_url = page.url
+        final_body = await page.locator("body").inner_text(timeout=5000)
+        if not outlook_rules_surface_detected(final_url, final_body):
+            raise RuntimeError(
+                "Outlook Rules/Forwarding page remained unhandled after one manual intervention; "
+                f"{await page_state_summary(page)}"
+            )
+    log(f"Opened Outlook settings panel and confirmed Rules/Forwarding page: {await page_state_summary(page)}")
 
 
 async def ensure_outlook_forward_rule_ready_for_writeback(
@@ -3538,7 +3886,32 @@ async def ensure_stop_processing_checked(scope) -> bool:
         checkbox = scope.get_by_role("checkbox", name=label_pattern).first
         if await checkbox.count() and not await checkbox.is_checked():
             await checkbox.check(timeout=3000)
-        return await outlook_stop_processing_checked(scope)
+        if await outlook_stop_processing_checked(scope):
+            return True
+    except Exception:
+        pass
+    # Some Outlook builds expose the visible text as a label without wiring
+    # the accessible checkbox name. Clicking that exact label is safe and
+    # handles the page variant used by standalone mailboxes.
+    try:
+        label = scope.get_by_text(label_pattern).first
+        if await label.count():
+            await label.click(timeout=3000)
+            await asyncio.sleep(0.3)
+            if await outlook_stop_processing_checked(scope):
+                return True
+    except Exception:
+        pass
+    # Final narrow fallback: only act when the current editor exposes exactly
+    # one visible native checkbox, never on an arbitrary input/search field.
+    try:
+        native = scope.locator("input[type=checkbox]:visible")
+        if await native.count() == 1:
+            checkbox = native.first
+            if not await checkbox.is_checked():
+                await checkbox.check(timeout=3000)
+            if await checkbox.is_checked():
+                return True
     except Exception:
         pass
     return await outlook_stop_processing_checked(scope)
@@ -3552,8 +3925,11 @@ async def outlook_forward_verification_required(page: Page) -> bool:
     lower = body.casefold()
     return (
         "sign in and verify your account to create a forwarding rule" in lower
+        or "sign in and verify account to create a forwarding rule" in lower
         or "登录并验证你的帐户" in body
         or "登录并验证你的账户" in body
+        or "登录并验证帐户" in body
+        or "登录并验证账户" in body
     )
 
 
@@ -3584,6 +3960,7 @@ async def wait_for_outlook_forward_verification_commit(
     deadline = time.monotonic() + max(0, timeout_ms) / 1000
     redirect_logged = False
     close_logged = False
+    refresh_attempted = False
     while time.monotonic() < deadline:
         if not await outlook_forward_verification_required(rule_page):
             log("Outlook forwarding verification committed in the rule editor.")
@@ -3593,6 +3970,14 @@ async def wait_for_outlook_forward_verification_commit(
                 if not close_logged:
                     log("Outlook forwarding verification popup closed; waiting for the rule editor to confirm completion.")
                     close_logged = True
+                if not refresh_attempted and time.monotonic() + 2 < deadline:
+                    refresh_attempted = True
+                    try:
+                        await rule_page.reload(wait_until="domcontentloaded")
+                        await wait_for_optional_page(1800, pause_controller, "Outlook rule editor refresh after verification")
+                        log("Refreshed Outlook rule editor after verification popup closed; rechecking commit state.")
+                    except Exception as exc:
+                        log(f"Outlook rule editor refresh after verification failed: {text_snippet(str(exc), 180)}")
             else:
                 try:
                     verification_url = (verification_page.url or "").casefold()
@@ -3744,6 +4129,13 @@ async def complete_outlook_forward_reauthentication(
         if challenge:
             await wait_for_timeout_with_stop(verification_page, 2000, pause_controller, "Outlook forwarding code method")
     if challenge:
+        from outlook_batch_login import collect_microsoft_security_mail_ids
+
+        existing_security_mail_ids = await collect_microsoft_security_mail_ids(security_page)
+        log(
+            f"Captured {len(existing_security_mail_ids)} existing Microsoft security-mail IDs "
+            f"before Outlook forwarding reauthentication for {account.email}."
+        )
         code_requested_at = await request_microsoft_security_email_code(
             verification_page,
             bind_email,
@@ -3766,6 +4158,7 @@ async def complete_outlook_forward_reauthentication(
                 on_manual_wait,
                 on_manual_resume,
                 not_before_epoch=code_requested_at,
+                exclude_message_ids=existing_security_mail_ids,
             )
             if not await outlook_forward_verification_required(rule_page):
                 log("Outlook forwarding reauthentication completed while reading the security code.")
@@ -3796,25 +4189,30 @@ async def complete_outlook_forward_reauthentication(
                 break
             if code_attempt < 2 and not verification_page.is_closed():
                 log(f"Microsoft security code attempt {code_attempt} did not complete; requesting one newer code.")
-                resent = await click_first(
-                    verification_page,
-                    [
-                        r"Send.*code", r"Get a new code", r"Didn't get a code",
-                        r"发送.*代码", r"获取新代码", r"没有收到代码",
-                    ],
-                    timeout_ms=3000,
+                from outlook_batch_login import collect_microsoft_security_mail_ids
+
+                # Exclude the code just tried before requesting another one;
+                # otherwise Outlook can surface the same unread message again.
+                existing_security_mail_ids.update(
+                    await collect_microsoft_security_mail_ids(security_page)
                 )
+                resent = await resend_microsoft_security_code(verification_page, pause_controller)
                 if resent:
                     code_requested_at = time.time()
-                    await wait_for_timeout_with_stop(
-                        verification_page,
-                        1500,
-                        pause_controller,
-                        "Outlook forwarding security-code resend",
-                    )
                 else:
-                    log("Microsoft did not expose a resend-code control; stopping code retries.")
-                    break
+                    log(
+                        "Microsoft returned to the verification-method page without a resend control; "
+                        "restarting the email-delivery method once for this same account."
+                    )
+                    code_requested_at = await request_microsoft_security_email_code(
+                        verification_page,
+                        bind_email,
+                        account.email,
+                        log,
+                        pause_controller,
+                        allow_redirect_without_code=True,
+                        on_security_mailbox_blocked=on_security_mailbox_blocked,
+                    )
         if not accepted:
             raise RuntimeError(f"Outlook 转发规则重新验证安全码被拒绝：{account.email}。")
         await wait_for_optional_page(2000, pause_controller, "Outlook forwarding code redirect")
@@ -4136,6 +4534,15 @@ async def run_forward_rule_setup(
             enabled_confirmed=enabled,
         )
     except RuntimeError as exc:
+        if (
+            is_outlook_context_retryable_error(exc)
+            and int(getattr(args, "_current_account_retry_count", 0) or 0) < 1
+        ):
+            log(
+                f"Outlook rule operation failed for {account.email}; "
+                "deferring the manual branch and retrying this account once with a rebuilt context."
+            )
+            raise
         retry_message = (
             f"自动创建或核验 Outlook 规则失败：{exc}\n"
             f"请按固定配置修正规则：名称={rule_name}；From={from_email}；Forward to={forward_to}；"
@@ -4163,8 +4570,11 @@ async def run_forward_rule_setup(
             rule_name=rule_name,
             enabled_confirmed=enabled,
         )
-    write_forward_rule_status(args, feishu_config, spreadsheet_token, sheet_id, account.row_number, forward_to)
-    log(f"Wrote forwarding target to row {account.row_number} column {FORWARD_RULE_COL}: {forward_to}")
+    if account.external_target or getattr(args, "external_only", False):
+        log(f"External target forwarding verified; no Feishu row writeback for {account.email}.")
+    else:
+        write_forward_rule_status(args, feishu_config, spreadsheet_token, sheet_id, account.row_number, forward_to)
+        log(f"Wrote forwarding target to row {account.row_number} column {FORWARD_RULE_COL}: {forward_to}")
 
 
 async def verify_security_mailbox(page: Page, security_email: str) -> bool:
@@ -4275,11 +4685,23 @@ async def ensure_security_mailbox_for_account(
             steam_id="",
         )
         await fill_login(page, login_account, pause_controller)
-        await handle_microsoft_post_login_prompts(page, log, pause_controller=pause_controller)
+        await handle_microsoft_post_login_prompts(
+            page,
+            log,
+            pause_controller=pause_controller,
+            on_manual_wait=on_manual_wait,
+            on_manual_resume=on_manual_resume,
+        )
         await redirect_microsoft_account_home_to_outlook(page, log, pause_controller)
         if await prefer_password_sign_in(page, pause_controller):
             log("Security mailbox login offered password sign-in; switched to password option.")
-            await handle_microsoft_post_login_prompts(page, log, pause_controller=pause_controller)
+            await handle_microsoft_post_login_prompts(
+                page,
+                log,
+                pause_controller=pause_controller,
+                on_manual_wait=on_manual_wait,
+                on_manual_resume=on_manual_resume,
+            )
             await redirect_microsoft_account_home_to_outlook(page, log, pause_controller)
         await handle_microsoft_blocking_page(
             page,
@@ -4412,6 +4834,26 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
         accounts, feishu_config, spreadsheet_token, sheet_id = read_pending_accounts(args)
     if args.limit:
         accounts = accounts[: args.limit]
+    if getattr(args, "external_only", False):
+        if not hasattr(args, "security_pool_full_emails"):
+            raise RuntimeError(
+                "表外转发目标必须先读取飞书 J 列并计算安全邮箱容量，禁止绕过满额过滤。"
+            )
+        full_security_mailboxes = {
+            str(email).strip().casefold()
+            for email in (getattr(args, "security_pool_full_emails", []) or [])
+        }
+        over_limit = sorted(
+            {
+                account.backup_security_email.strip().casefold()
+                for account in accounts
+                if account.backup_security_email.strip().casefold() in full_security_mailboxes
+            }
+        )
+        if over_limit:
+            raise RuntimeError(
+                "表外转发目标选择了已满的安全邮箱，已阻止运行：" + ", ".join(over_limit)
+            )
     on_pending(accounts)
     if not accounts:
         log("No pending accounts for selected task mode.")
@@ -4423,7 +4865,7 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
             log(f"row {account.row_number}: {account.steam_username} / {account.email}")
         return
 
-    if task_mode == "forward_rule":
+    if task_mode == "forward_rule" and not getattr(args, "external_only", False):
         ensure_forward_rule_header(args, feishu_config, spreadsheet_token, sheet_id)
 
     steam_exe = None
@@ -4483,6 +4925,8 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                 on_account_start(account, idx, len(accounts))
                 log(f"[{idx}/{len(accounts)}] row {account.row_number}: steam={account.steam_username}, email={account.email}")
                 row_result = "已完成"
+                retry_key = account.row_number if account.row_number else account.email.strip().casefold()
+                args._current_account_retry_count = browser_retry_counts.get(retry_key, 0)
                 try:
                     security_binding_completed = not account.security_binding_required
                     if (
@@ -4569,11 +5013,23 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                                 target_context_email = expected_target_email
                             else:
                                 await fill_login(outlook_page, account, pause_controller)
-                                await handle_microsoft_post_login_prompts(outlook_page, log, pause_controller=pause_controller)
+                                await handle_microsoft_post_login_prompts(
+                                    outlook_page,
+                                    log,
+                                    pause_controller=pause_controller,
+                                    on_manual_wait=on_manual_wait,
+                                    on_manual_resume=on_manual_resume,
+                                )
                                 await redirect_microsoft_account_home_to_outlook(outlook_page, log, pause_controller)
                                 if await prefer_password_sign_in(outlook_page, pause_controller):
                                     log("Target mailbox login offered password sign-in; switched to password option.")
-                                    await handle_microsoft_post_login_prompts(outlook_page, log, pause_controller=pause_controller)
+                                    await handle_microsoft_post_login_prompts(
+                                        outlook_page,
+                                        log,
+                                        pause_controller=pause_controller,
+                                        on_manual_wait=on_manual_wait,
+                                        on_manual_resume=on_manual_resume,
+                                    )
                                     await redirect_microsoft_account_home_to_outlook(outlook_page, log, pause_controller)
                             if not session_reused and security_page and account.backup_security_email and await is_recovery_email_setup_page(outlook_page):
                                 security_binding_completed = await complete_recovery_email_setup(
@@ -4593,6 +5049,8 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                                         outlook_page,
                                         log,
                                         pause_controller=pause_controller,
+                                        on_manual_wait=on_manual_wait,
+                                        on_manual_resume=on_manual_resume,
                                     )
                                     await outlook_page.goto(OUTLOOK_MAIL_URL, wait_until="domcontentloaded")
                             if not session_reused and await security_challenge_visible(outlook_page):
@@ -4643,13 +5101,24 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                                                 f"Using existing security mailbox session for verification: "
                                                 f"{account.backup_security_email}"
                                             )
-                                    code_requested_at = await submit_security_email_or_record_failure(
+                                    from outlook_batch_login import collect_microsoft_security_mail_ids
+
+                                    existing_security_mail_ids = (
+                                        await collect_microsoft_security_mail_ids(security_page)
+                                        if security_page
+                                        else set()
+                                    )
+                                    log(
+                                        f"Captured {len(existing_security_mail_ids)} existing Microsoft security-mail IDs "
+                                        f"before target-login verification for {account.email}."
+                                    )
+                                    code_requested_at = await request_microsoft_security_email_code(
                                         outlook_page,
                                         challenge_security_email,
                                         account.email,
                                         log,
-                                        on_security_mailbox_blocked,
                                         pause_controller,
+                                        on_security_mailbox_blocked=on_security_mailbox_blocked,
                                     )
                                 if args.security_code_source == "browser":
                                     code_accepted = False
@@ -4663,6 +5132,7 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                                             on_manual_wait,
                                             on_manual_resume,
                                             not_before_epoch=code_requested_at,
+                                            exclude_message_ids=existing_security_mail_ids,
                                         )
                                         if await submit_microsoft_security_code_with_validation(
                                             outlook_page,
@@ -4672,15 +5142,50 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                                             pause_controller,
                                         ):
                                             code_accepted = True
-                                            await handle_microsoft_post_login_prompts(outlook_page, log, pause_controller=pause_controller)
+                                            await handle_microsoft_post_login_prompts(
+                                                outlook_page,
+                                                log,
+                                                pause_controller=pause_controller,
+                                                on_manual_wait=on_manual_wait,
+                                                on_manual_resume=on_manual_resume,
+                                            )
                                             break
-                                        log(f"Microsoft security code attempt {microsoft_code_attempt} rejected for {account.email}; waiting for a newer code.")
-                                        await wait_for_timeout_with_stop(
-                                            outlook_page,
-                                            5000,
-                                            pause_controller,
-                                            f"Microsoft security code retry for {account.email}",
-                                        )
+                                        if microsoft_code_attempt < 2:
+                                            log(
+                                                f"Microsoft security code attempt {microsoft_code_attempt} rejected for "
+                                                f"{account.email}; requesting a fresh code before retrying this account."
+                                            )
+                                            if not await resend_microsoft_security_code(outlook_page, pause_controller):
+                                                # After a rejected code Microsoft may return to the
+                                                # proof-method chooser. That page has no resend button;
+                                                # re-select the assigned email method and submit a new
+                                                # request instead of treating the missing button as fatal.
+                                                from outlook_batch_login import collect_microsoft_security_mail_ids
+
+                                                existing_security_mail_ids = await collect_microsoft_security_mail_ids(
+                                                    security_page
+                                                )
+                                                code_requested_at = await request_microsoft_security_email_code(
+                                                    outlook_page,
+                                                    account.backup_security_email or args.security_email,
+                                                    account.email,
+                                                    log,
+                                                    pause_controller,
+                                                    on_security_mailbox_blocked=on_security_mailbox_blocked,
+                                                )
+                                            else:
+                                                code_requested_at = time.time()
+                                            await wait_for_timeout_with_stop(
+                                                outlook_page,
+                                                500,
+                                                pause_controller,
+                                                f"Microsoft security code retry for {account.email}",
+                                            )
+                                        else:
+                                            log(
+                                                f"Microsoft security code attempt {microsoft_code_attempt} rejected for "
+                                                f"{account.email}; retry limit reached for this account."
+                                            )
                                     if not code_accepted:
                                         raise RuntimeError(f"Microsoft security code was rejected twice for {account.email}.")
                             else:
@@ -4693,7 +5198,13 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                                     on_manual_resume,
                                 )
                         await cancel_passkey_prompt(outlook_page, log, pause_controller=pause_controller)
-                        await handle_microsoft_post_login_prompts(outlook_page, log, pause_controller=pause_controller)
+                        await handle_microsoft_post_login_prompts(
+                            outlook_page,
+                            log,
+                            pause_controller=pause_controller,
+                            on_manual_wait=on_manual_wait,
+                            on_manual_resume=on_manual_resume,
+                        )
                         if not session_reused:
                             await wait_for_outlook_inbox(
                                 outlook_page,
@@ -4902,13 +5413,14 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                         log("Dota check skipped because Dota verification is disabled.")
                     on_account_done(account, steam_id)
                 except Exception as exc:
-                    retry_count = browser_retry_counts.get(account.row_number, 0)
+                    retry_key = account.row_number if account.row_number else account.email.strip().casefold()
+                    retry_count = browser_retry_counts.get(retry_key, 0)
                     if (
                         is_outlook_context_retryable_error(exc)
                         and retry_count < 1
                         and not (pause_controller and pause_controller.should_stop())
                     ):
-                        browser_retry_counts[account.row_number] = retry_count + 1
+                        browser_retry_counts[retry_key] = retry_count + 1
                         log(
                             f"Outlook context became closed or unverifiable on row {account.row_number}; "
                             "rebuilding only the affected Outlook context and retrying this row once."
@@ -4950,7 +5462,14 @@ async def run_with_callbacks(args, callbacks: dict[str, Any] | None = None) -> N
                     await save_page_screenshot(security_page, security_screenshot, "Security mailbox", log)
                     log(f"ERROR on row {account.row_number}: {exc}")
                     on_account_error(account, exc)
-                    if not args.continue_on_error:
+                    # Task 3 has a durable Feishu checkpoint in K.  Any error
+                    # must stop the whole run so an account is never silently
+                    # skipped after an unrecognized page or login failure.
+                    if (
+                        not args.continue_on_error
+                        or getattr(args, "task_mode", "") == "forward_rule"
+                        or is_non_skippable_verification_error(exc)
+                    ):
                         break
 
                 if not wait_between_accounts(args, account, idx, len(accounts), row_result, log, pause_controller, on_manual_wait, on_manual_resume):

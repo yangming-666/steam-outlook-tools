@@ -165,6 +165,57 @@ authStore.getLocalAccessToken(process.argv[1])
     raise FeishuError("No stored user access token. Run: python feishu_tool.py login-user")
 
 
+def refresh_stored_user_access_token(config: dict[str, Any], package_root: Path) -> str:
+    """Refresh the locally stored OAuth token without requiring a new consent click."""
+    handler_js = package_root / "node_modules" / "@larksuiteoapi" / "lark-mcp" / "dist" / "auth" / "handler" / "handler-local.js"
+    store_js = package_root / "node_modules" / "@larksuiteoapi" / "lark-mcp" / "dist" / "auth" / "store.js"
+    if not handler_js.exists() or not store_js.exists():
+        raise FeishuError(f"Missing lark-mcp OAuth runtime under: {package_root}")
+    script = r"""
+const { LarkAuthHandlerLocal } = require(process.argv[3]);
+const { authStore } = require(process.argv[4]);
+(async () => {
+  const appId = process.argv[1];
+  const appSecret = process.argv[2];
+  const accessToken = await authStore.getLocalAccessToken(appId);
+  if (!accessToken) throw new Error('No stored user access token');
+  const handler = new LarkAuthHandlerLocal({}, {
+    appId,
+    appSecret,
+    domain: 'https://open.feishu.cn',
+    host: 'localhost',
+    port: 3000,
+  });
+  const token = await handler.refreshToken(accessToken);
+  await authStore.storeLocalAccessToken(token.access_token, appId);
+  process.stdout.write(token.access_token);
+})().catch(error => {
+  process.stderr.write(String(error && (error.stack || error.message) || error));
+  process.exit(1);
+});
+"""
+    completed = subprocess.run(
+        [
+            "node",
+            "-e",
+            script,
+            str(config["appId"]),
+            str(config["appSecret"]),
+            str(handler_js).replace("\\", "/"),
+            str(store_js).replace("\\", "/"),
+        ],
+        cwd=str(package_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    token = completed.stdout.strip()
+    if completed.returncode == 0 and token:
+        return token
+    detail = completed.stderr.strip() or completed.stdout.strip() or "unknown refresh failure"
+    raise FeishuError(f"Could not refresh Feishu user access token: {detail}")
+
+
 def parse_sse_json(text: str) -> dict[str, Any]:
     data_lines = []
     for line in text.splitlines():
@@ -239,7 +290,15 @@ def feishu_api(
     package_root: Path = DEFAULT_LARK_MCP_ROOT,
 ) -> dict[str, Any]:
     token = get_stored_user_access_token(config, package_root) if use_uat else get_tenant_access_token(config)
-    return http_json(method, f"https://open.feishu.cn{path}", body, {"Authorization": f"Bearer {token}"})
+    url = f"https://open.feishu.cn{path}"
+    try:
+        return http_json(method, url, body, {"Authorization": f"Bearer {token}"})
+    except FeishuError as exc:
+        auth_error = any(marker in str(exc).casefold() for marker in ("401 unauthorized", "99991677", "token expired"))
+        if not use_uat or not auth_error:
+            raise
+        refreshed = refresh_stored_user_access_token(config, package_root)
+        return http_json(method, url, body, {"Authorization": f"Bearer {refreshed}"})
 
 
 def parse_feishu_url(url: str) -> dict[str, str | None]:
