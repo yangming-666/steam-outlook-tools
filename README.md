@@ -1,4 +1,4 @@
-# BatchSignUp
+# Steam & Outlook Tools
 
 Windows 本地账号与邮件工作流工具集：通过浏览器、桌面客户端和飞书表格，辅助管理本人或已获授权的 Outlook、Steam 账号流程。
 
@@ -26,8 +26,8 @@ Windows 本地账号与邮件工作流工具集：通过浏览器、桌面客户
 在 Windows 上安装 Python 3.11+，再执行：
 
 ```powershell
-git clone https://github.com/yangming-666/batchsignup.git
-cd batchsignup
+git clone https://github.com/yangming-666/steam-outlook-tools.git
+cd steam-outlook-tools
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
