@@ -1,0 +1,33 @@
+name: Source integrity
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  source-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check tracked source syntax and text integrity
+        shell: python
+        run: |
+          import ast
+          import pathlib
+          import subprocess
+          names = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')
+          checked = 0
+          for name in filter(None, names):
+              path = pathlib.Path(name)
+              if not path.is_file() or path.suffix not in {'.py', '.md', '.json', '.yml', '.yaml', '.toml'}:
+                  continue
+              data = path.read_bytes()
+              assert b'\0' not in data, f'Null bytes in text source: {name}'
+              if path.suffix == '.py':
+                  ast.parse(data.decode('utf-8-sig'), filename=name)
+              checked += 1
+          print(f'Checked {checked} tracked source files. Runtime and integration behavior are not tested here.')

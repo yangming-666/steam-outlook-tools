@@ -17,3 +17,9 @@ accounts_sample.csv
 
 .env
 *.secret
+
+# Private account reports and local analysis
+*.xlsx
+make_report.py
+.pytest_cache/
+.venv/

@@ -23,19 +23,19 @@ python feishu_tool.py list-tools
 解析 wiki 链接到真实表格 token：
 
 ```powershell
-python feishu_tool.py resolve "https://ru8q9fv50i.feishu.cn/wiki/IM3jw5X9Sialj4k5OupckZK5nBh?sheet=xUJBaF"
+python feishu_tool.py resolve "https://your-team.feishu.cn/wiki/YOUR_DOCUMENT_TOKEN?sheet=YOUR_SHEET_ID"
 ```
 
 读取表格范围：
 
 ```powershell
-python feishu_tool.py read-sheet "https://ru8q9fv50i.feishu.cn/wiki/IM3jw5X9Sialj4k5OupckZK5nBh?sheet=xUJBaF" --range A1:Z20
+python feishu_tool.py read-sheet "https://your-team.feishu.cn/wiki/YOUR_DOCUMENT_TOKEN?sheet=YOUR_SHEET_ID" --range A1:Z20
 ```
 
 写入单元格：
 
 ```powershell
-python feishu_tool.py write-sheet "https://ru8q9fv50i.feishu.cn/wiki/IM3jw5X9Sialj4k5OupckZK5nBh?sheet=xUJBaF" --range A1:A1 --values-json '[[\"test\"]]'
+python feishu_tool.py write-sheet "https://your-team.feishu.cn/wiki/YOUR_DOCUMENT_TOKEN?sheet=YOUR_SHEET_ID" --range A1:A1 --values-json '[[\"test\"]]'
 ```
 
 如果写入返回 `91403 Forbidden`，说明当前飞书应用对该文档没有编辑权限，或开放平台没有开通表格写权限。需要把应用/机器人加入该文档协作者并授予可编辑权限，再重试。
@@ -51,13 +51,13 @@ python feishu_tool.py login-user
 登录完成后用 `--use-uat` 写入：
 
 ```powershell
-python feishu_tool.py write-sheet "https://ru8q9fv50i.feishu.cn/wiki/IM3jw5X9Sialj4k5OupckZK5nBh?sheet=xUJBaF" --range Z20:Z20 --values-json '[[\"test\"]]' --use-uat
+python feishu_tool.py write-sheet "https://your-team.feishu.cn/wiki/YOUR_DOCUMENT_TOKEN?sheet=YOUR_SHEET_ID" --range Z20:Z20 --values-json '[[\"test\"]]' --use-uat
 ```
 
 读取也可以走当前账号：
 
 ```powershell
-python feishu_tool.py read-sheet "https://ru8q9fv50i.feishu.cn/wiki/IM3jw5X9Sialj4k5OupckZK5nBh?sheet=xUJBaF" --range A1:Z20 --use-uat
+python feishu_tool.py read-sheet "https://your-team.feishu.cn/wiki/YOUR_DOCUMENT_TOKEN?sheet=YOUR_SHEET_ID" --range A1:Z20 --use-uat
 ```
 
 直接调用任意 MCP 工具：
